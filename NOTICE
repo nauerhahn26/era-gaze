@@ -1,0 +1,15 @@
+New ERA Communications — era-gaze
+Copyright (c) 2026 the New ERA Communications authors.
+Licensed under the Mozilla Public License 2.0 (see LICENSE).
+
+ERAgaze links at runtime against the Tobii Stream Engine library found in the
+user's own Tobii installation; no Tobii software is included in or
+redistributed with this project. Tobii and TD Snap are trademarks of their
+respective owners; this project is not affiliated with or endorsed by Tobii.
+
+Interoperability attribution: the gaze-bus message shape
+({gazePoint:{x,y}, validity, timestamp} + GET /status) was adopted for
+interoperability from Aivota AAC's gaze sidecar contract, with the developer's
+knowledge from a July 2026 collaboration; the implementation is entirely
+independent. Signal-processing draws on the published One-Euro filter
+(Casiez, Roussel, Vogel 2012).

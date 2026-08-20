@@ -1,0 +1,18 @@
+# era-gaze
+
+The gaze layer of the New ERA Communications family: **ERAgaze**, a single-file
+C# engine (no SDK, no packages — compiles with the .NET Framework csc.exe that
+ships in Windows) for Tobii Stream Engine trackers (TD I-13, PCEye, ...):
+
+- stabilized OS cursor + soft dwell ring (median spike-reject → One-Euro filter,
+  fixation lock, blink grace, track-loss park at a rest corner)
+- the **gaze bus**: WebSocket + HTTP on `127.0.0.1:49155` — apps subscribe to
+  gaze samples and call `/app/exit`, `/app/park`, `/status`, `/config`
+- dwell-click stays OFF by default: apps own activation (see era-core dwell.js)
+
+`volume-cap/` — an optional generic Windows utility that clamps master volume
+to a configured cap (Core Audio event + poll; never touches mute/vol-down).
+
+Requires the device's own Tobii runtime (the installer locates
+`tobii_stream_engine.dll` in the existing Tobii installation — nothing
+proprietary is bundled or redistributed). License: MPL-2.0; see NOTICE.
