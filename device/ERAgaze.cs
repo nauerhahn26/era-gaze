@@ -112,7 +112,7 @@ static class Cfg {
     // ---- movie-player watch mode (v2.5, D57) ----
     public static string StreamingProfileDir = "";  // "" = <BaseDir>\streaming-profile
     public static string ChromePath = "";           // "" = auto-detect the standard Chrome installs
-    public static int WatchDismissMs = 20000;       // options-strip auto-dismiss (her >=20s response profile)
+    public static int WatchDismissMs = 15000;       // options-strip auto-dismiss (her >=20s response profile)
     public static int WatchWakeDwellMs = 1600;      // wake dwell — nav tier; LoadFile floors this at 1600
     public static int WatchWakeSizePx = 120;        // corner wake-target square, px
     public static string WatchWakeCorner = "auto";  // auto = corner OPPOSITE the park corner; tl/tr/bl/br to pin
@@ -245,7 +245,7 @@ static class Cfg {
 "  \"_doc5\": \"Watch mode (movie player): StreamingProfileDir '' = <BaseDir>\\\\streaming-profile; ChromePath '' = auto-detect; WatchWakeCorner auto = opposite the park corner; WatchWakeDwellMs floors at 1600 (nav tier); WatchDismissMs = options-strip auto-dismiss; WatchFeedbackPct = wake-corner region (% screen width) where the cursor+ring return as gaze feedback.\",\n" +
 "  \"StreamingProfileDir\": \"\",\n" +
 "  \"ChromePath\": \"\",\n" +
-"  \"WatchDismissMs\": 20000,\n" +
+"  \"WatchDismissMs\": 15000,\n" +
 "  \"WatchWakeDwellMs\": 1600,\n" +
 "  \"WatchWakeSizePx\": 120,\n" +
 "  \"WatchWakeCorner\": \"auto\",\n" +
@@ -695,7 +695,7 @@ sealed class Bus {
                     ctx.Response.AddHeader("Access-Control-Allow-Headers", "Content-Type");
                     if (ctx.Request.HttpMethod == "OPTIONS") { ctx.Response.StatusCode = 204; ctx.Response.Close(); }
                     else if (ctx.Request.HttpMethod == "POST") {
-                        string url = "", titleId = "", profile = ""; bool watch = false;
+                        string url = "", titleId = "", profile = "", nextUrl = "", nextLabel = ""; bool watch = false;
                         try {
                             string bodyIn;
                             using (var sr = new StreamReader(ctx.Request.InputStream, ctx.Request.ContentEncoding)) bodyIn = sr.ReadToEnd();
@@ -706,6 +706,12 @@ sealed class Bus {
                                 if (d.TryGetValue("watch", out v)) watch = Convert.ToBoolean(v);
                                 if (d.TryGetValue("titleId", out v)) titleId = Convert.ToString(v) ?? "";
                                 if (d.TryGetValue("profile", out v)) profile = Convert.ToString(v) ?? "";
+                                if (d.TryGetValue("next", out v)) {
+                                    var nd = v as Dictionary<string, object>;
+                                    object nv;
+                                    if (nd != null && nd.TryGetValue("url", out nv)) nextUrl = Convert.ToString(nv) ?? "";
+                                    if (nd != null && nd.TryGetValue("label", out nv)) nextLabel = Convert.ToString(nv) ?? "";
+                                }
                             }
                         } catch { }
                         // http(s) only; no quotes/whitespace — the url lands on a command line
@@ -721,6 +727,8 @@ sealed class Bus {
                         ctx.Response.OutputStream.Write(rl, 0, rl.Length);
                         ctx.Response.Close();
                         if (okReq) {
+                            bool nOk = nextUrl.StartsWith("https://") && nextUrl.IndexOf('"') < 0 && nextUrl.IndexOf(' ') < 0;
+                            Watch.SetMedia(url, titleId, nOk ? nextUrl : null, nOk ? nextLabel : null);
                             string u2 = url, t2 = titleId, p2 = profile; bool w2 = watch;
                             System.Threading.ThreadPool.QueueUserWorkItem(delegate { Program.LaunchStreamingKiosk(u2, w2, t2, p2); });
                         }
@@ -981,6 +989,21 @@ static class Watch {
         });
     }
 
+    // media context for the rail buttons (restart / next episode). Set by the bus
+    // on every /app/launch; a boot RE-ARM has none -> both rail buttons hidden.
+    static volatile string mediaUrl, mediaTitle, mediaNextUrl, mediaNextLabel;
+    public static void SetMedia(string url, string titleId, string nxUrl, string nxLabel) {
+        mediaUrl = url; mediaTitle = titleId; mediaNextUrl = nxUrl; mediaNextLabel = nxLabel;
+    }
+    static void Relaunch(string url) {   // restart / next: same pipeline as /app/launch
+        string dir; lock (gate) { dir = Active ? profileDir : Cfg.StreamingDir(); }
+        DismissStrip("relaunch");
+        string u = url, t = mediaTitle ?? "";
+        System.Threading.ThreadPool.QueueUserWorkItem(delegate {
+            Program.LaunchStreamingKiosk(u, true, t, "");
+        });
+    }
+
     public static void Begin(string dir, string titleId, int pid) {   // bus thread
         lock (gate) { profileDir = dir; kioskPid = pid; fgCache.Clear(); }
         strip = false; Active = true;
@@ -1141,7 +1164,13 @@ static class Watch {
 
     static void Fire(int idx) {   // UI thread (dwell completion or Tap)
         switch (idx) {
-            case 0: {
+            case 0: {   // exit (D57c): ONE exit — back to the movie chooser. Full exit
+                        // to TD Snap lives on the picker's header door, like every board.
+                DismissStrip("exit-to-picker");
+                EndAndClose(true, "exit-to-picker");
+                break;
+            }
+            case 1: {
                 // pause/play: TOGGLE SEMANTICS BY DESIGN — no state model. The strip shows
                 // no play/pause state, so there is nothing to desync with the player; the
                 // media key routes to the active media session even unfocused.
@@ -1149,24 +1178,30 @@ static class Watch {
                 Log.W("watch: play/pause");
                 break;
             }
-            case 1:
-            case 2: {
+            case 2:
+            case 3: {
                 // OS volume nudge. The volume cap (integrated or legacy) stays the hard
                 // ceiling — it clamps ABOVE us within ~100ms; strictest wins, no
                 // interaction with the volcap code needed.
-                ushort vk = idx == 1 ? Native.VK_VOLUME_UP : Native.VK_VOLUME_DOWN;
+                ushort vk = idx == 2 ? Native.VK_VOLUME_UP : Native.VK_VOLUME_DOWN;
                 for (int i = 0; i < Cfg.WatchVolSteps; i++) Native.Key(vk);
-                Log.W("watch: volume " + (idx == 1 ? "up" : "down"));
+                Log.W("watch: volume " + (idx == 2 ? "up" : "down"));
                 break;
             }
-            case 3: {   // pick another: close the streaming kiosk, reveal the picker
-                DismissStrip("pick-another");
-                EndAndClose(true, "pick-another");
+            case 4: {   // rail: restart the movie from the beginning (deliberate small
+                        // button — D57c; Netflix honors ?t=0, others get a plain relaunch)
+                string u = mediaUrl; if (u == null) break;
+                if (u.Contains("netflix.com/watch/"))
+                    u = u.Split('?')[0] + "?t=0";
+                Log.W("watch: restart -> " + u);
+                Relaunch(u);
                 break;
             }
-            case 4: {   // all done: close the streaming kiosk, hand the screen to ForegroundApp
-                DismissStrip("all-done");
-                EndAndClose(false, "all-done");
+            case 5: {   // rail: next episode (one hop, url precomputed by the board)
+                string u = mediaNextUrl; if (u == null) break;
+                Log.W("watch: next episode -> " + u);
+                mediaUrl = u; mediaNextUrl = null; mediaNextLabel = null;
+                Relaunch(u);
                 break;
             }
         }
@@ -1202,14 +1237,26 @@ static class Watch {
     }
 
     // ---- geometry + drawing ----
+    // D57c layout (dad 8/28, photo round): four TD-Snap-tile-sized MAIN tiles in a
+    // row along the TOP (least gaze travel from the wake corner; the strip never
+    // fills the screen), plus a SMALL left rail under the wake target for the
+    // deliberate-but-rare actions (restart / next episode) — TD Snap sidebar idiom.
+    // Fixed 6 slots; hidden rail buttons are Rectangle.Empty (Contains()==false).
     static Rectangle[] TileRects(out Rectangle box) {
-        int t = Cfg.WatchTilePx, gap = 24; const int n = 5;
-        int sw = Program.ScreenW;
-        if (n * t + (n - 1) * gap > sw - 32) t = (sw - 32 - (n - 1) * gap) / n;   // small screens
-        int w = n * t + (n - 1) * gap, x0 = (sw - w) / 2, y0 = (Program.ScreenH - t) / 2;
-        box = new Rectangle(x0, y0, w, t);
-        var r = new Rectangle[n];
-        for (int i = 0; i < n; i++) r[i] = new Rectangle(x0 + i * (t + gap), y0, t, t);
+        int sw = Program.ScreenW, sh = Program.ScreenH, gap = 20;
+        Rectangle wk = WakeRect();
+        int rw = 190, rh = 104, rx = 12, ry = wk.Bottom + 16;
+        // main row clears the rail COLUMN (fixed origin whether or not the rail
+        // buttons are visible — positions never move, her spatial map holds)
+        int x0 = rx + rw + 16, y0 = 12;
+        int tw = Math.Min(((sw - x0 - 12) - 3 * gap) / 4, 480);   // ~ her 4-wide tile
+        int th = (int)(sh * 0.26);                                // ~ her 3-high tile
+        var r = new Rectangle[6];
+        for (int i = 0; i < 4; i++) r[i] = new Rectangle(x0 + i * (tw + gap), y0, tw, th);
+        r[4] = (mediaUrl != null) ? new Rectangle(rx, ry, rw, rh) : Rectangle.Empty;
+        r[5] = (mediaNextUrl != null) ? new Rectangle(rx, ry + rh + 14, rw, rh) : Rectangle.Empty;
+        int bx1 = rx, by1 = y0, bx2 = x0 + 4 * tw + 3 * gap, by2 = Math.Max(y0 + th, ry + 2 * rh + 14);
+        box = new Rectangle(bx1, by1, bx2 - bx1, by2 - by1);
         return r;
     }
 
@@ -1250,8 +1297,10 @@ static class Watch {
 
     // \u escapes (not raw literals): the file has no BOM and csc would read raw
     // non-ASCII through the system codepage. U+23EF play/pause, U+2212 minus.
-    static readonly string[] TileGlyphs = { "\u23EF", "+", "\u2212", null, null };
-    static readonly string[] TileLabels = { "pause / play", "louder", "softer", "pick another", "all done" };
+    static readonly string[] TileGlyphs = { "\u2190", "\u23EF", "+", "\u2212", null, null };
+    static readonly string[] TileLabels = { "movies", "pause / play", "louder", "softer", "restart", "next episode" };
+    // house grammar (D57c): teal = controls/doors, white = content-style tiles
+    static readonly bool[] TileTeal = { true, false, false, false, true, true };
 
     // Shrink-to-fit: largest size (stepping down) whose wrapped text fits the rect.
     // 8/28 tablet smoke: fixed sizes clipped "pick another"->"pick ano" etc. — her
@@ -1274,7 +1323,7 @@ static class Watch {
     }
 
     static void DrawStrip(Rectangle[] tiles, Rectangle box, int hover, double prog) {
-        int key = (hover + 2) * 1000 + (int)(prog * 40);
+        int key = (hover + 2) * 1000 + (int)(prog * 40) + (mediaUrl != null ? 100000 : 0) + (mediaNextUrl != null ? 200000 : 0);
         if (key == lastStripKey) return;
         lastStripKey = key;
         using (var bmp = new Bitmap(box.Width, box.Height, PixelFormat.Format32bppArgb))
@@ -1282,30 +1331,42 @@ static class Watch {
         using (var fmt = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center }) {
             g.SmoothingMode = SmoothingMode.AntiAlias;
             g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAlias;
+            // house grammar (D57c): white content tiles with dark ink, teal controls
+            // with white ink — the board's visual language, not a bespoke look.
+            var ink = Color.FromArgb(255, 23, 39, 46);
+            var teal = Color.FromArgb(244, 15, 124, 138);
+            var white = Color.FromArgb(246, 247, 249, 249);
             for (int i = 0; i < tiles.Length; i++) {
-                var lr = new Rectangle(tiles[i].X - box.X, 0, tiles[i].Width, tiles[i].Height);
-                using (var path = Rounded(lr, 18)) {
-                    // near-black backing, thick white border: high contrast over any video
-                    using (var bg = new SolidBrush(Color.FromArgb(232, 16, 18, 22))) g.FillPath(bg, path);
-                    using (var pen = new Pen(Color.FromArgb(255, 245, 250, 250), i == hover ? 6f : 3f)) g.DrawPath(pen, path);
+                if (tiles[i].IsEmpty) continue;
+                bool rail = i >= 4;
+                var lr = new Rectangle(tiles[i].X - box.X, tiles[i].Y - box.Y, tiles[i].Width, tiles[i].Height);
+                using (var path = Rounded(lr, rail ? 12 : 18)) {
+                    using (var bg = new SolidBrush(TileTeal[i] ? teal : white)) g.FillPath(bg, path);
+                    var border = i == hover ? Color.FromArgb(255, 122, 205, 216)
+                               : TileTeal[i] ? Color.FromArgb(255, 236, 248, 249)
+                                             : Color.FromArgb(255, 23, 39, 46);
+                    using (var pen = new Pen(border, i == hover ? 6f : 2.5f)) g.DrawPath(pen, path);
                 }
-                using (var white = new SolidBrush(Color.White)) {
-                    if (TileGlyphs[i] != null) {
+                using (var fg = new SolidBrush(TileTeal[i] ? Color.White : ink)) {
+                    if (rail) {   // small deliberate buttons: text only, modest type
+                        var full = new RectangleF(lr.X + 6, lr.Y + 4, lr.Width - 12, lr.Height - 8);
+                        using (var f = FitFont(g, TileLabels[i], 22f, 12f, full.Size, fmt))
+                            g.DrawString(TileLabels[i], f, fg, full, fmt);
+                    } else if (TileGlyphs[i] != null) {
                         using (var f = new Font("Segoe UI Symbol", 52, FontStyle.Bold))
-                            g.DrawString(TileGlyphs[i], f, white, new RectangleF(lr.X, lr.Y, lr.Width, lr.Height * 0.64f), fmt);
-                        var sub = new RectangleF(lr.X + 6, lr.Y + lr.Height * 0.60f, lr.Width - 12, lr.Height * 0.34f);
-                        using (var f2 = FitFont(g, TileLabels[i], 20f, 10f, sub.Size, fmt))
-                            g.DrawString(TileLabels[i], f2, white, sub, fmt);
+                            g.DrawString(TileGlyphs[i], f, fg, new RectangleF(lr.X, lr.Y, lr.Width, lr.Height * 0.60f), fmt);
+                        var sub = new RectangleF(lr.X + 6, lr.Y + lr.Height * 0.56f, lr.Width - 12, lr.Height * 0.38f);
+                        using (var f2 = FitFont(g, TileLabels[i], 26f, 12f, sub.Size, fmt))
+                            g.DrawString(TileLabels[i], f2, fg, sub, fmt);
                     } else {
-                        // text-forward nav tiles (her spec: text over symbols, large type)
                         var full = new RectangleF(lr.X + 8, lr.Y + 6, lr.Width - 16, lr.Height - 12);
                         using (var f = FitFont(g, TileLabels[i], 30f, 14f, full.Size, fmt))
-                            g.DrawString(TileLabels[i], f, white, full, fmt);
+                            g.DrawString(TileLabels[i], f, fg, full, fmt);
                     }
                 }
-                if (i == hover && prog > 0) {   // dwell progress: teal bar along the tile bottom
-                    using (var bar = new SolidBrush(Color.FromArgb(255, 122, 205, 216)))
-                        g.FillRectangle(bar, lr.X + 10, lr.Bottom - 16, (int)((lr.Width - 20) * prog), 8);
+                if (i == hover && prog > 0) {   // dwell progress bar along the tile bottom
+                    using (var bar = new SolidBrush(TileTeal[i] ? Color.White : Color.FromArgb(255, 15, 124, 138)))
+                        g.FillRectangle(bar, lr.X + 10, lr.Bottom - 14, (int)((lr.Width - 20) * prog), 7);
                 }
             }
             stripOv.SetFrame(bmp, box.X, box.Y);
