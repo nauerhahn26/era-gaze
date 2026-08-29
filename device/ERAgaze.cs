@@ -1195,6 +1195,26 @@ static class Watch {
     static readonly string[] TileGlyphs = { "\u23EF", "+", "\u2212", null, null };
     static readonly string[] TileLabels = { "pause / play", "louder", "softer", "pick another", "all done" };
 
+    // Shrink-to-fit: largest size (stepping down) whose wrapped text fits the rect.
+    // 8/28 tablet smoke: fixed sizes clipped "pick another"->"pick ano" etc. — her
+    // text-forward tiles must never truncate a word.
+    static Font FitFont(Graphics g, string text, float start, float min, SizeF room, StringFormat fmt) {
+        float size = start;
+        string[] words = text.Split(' ');
+        while (size > min) {
+            using (var f = new Font("Segoe UI", size, FontStyle.Bold)) {
+                var m = g.MeasureString(text, f, new SizeF(room.Width, 10000f), fmt);
+                // widest single word must fit on one line — GDI+ otherwise breaks
+                // mid-word ("another" -> "anothe/r"), which her tiles must never do
+                float word = 0f;
+                foreach (var w in words) { var s = g.MeasureString(w, f); if (s.Width > word) word = s.Width; }
+                if (m.Width <= room.Width && m.Height <= room.Height && word <= room.Width) break;
+            }
+            size -= 2f;
+        }
+        return new Font("Segoe UI", size, FontStyle.Bold);
+    }
+
     static void DrawStrip(Rectangle[] tiles, Rectangle box, int hover, double prog) {
         int key = (hover + 2) * 1000 + (int)(prog * 40);
         if (key == lastStripKey) return;
@@ -1215,12 +1235,14 @@ static class Watch {
                     if (TileGlyphs[i] != null) {
                         using (var f = new Font("Segoe UI Symbol", 52, FontStyle.Bold))
                             g.DrawString(TileGlyphs[i], f, white, new RectangleF(lr.X, lr.Y, lr.Width, lr.Height * 0.64f), fmt);
-                        using (var f2 = new Font("Segoe UI", 20, FontStyle.Bold))
-                            g.DrawString(TileLabels[i], f2, white, new RectangleF(lr.X, lr.Y + lr.Height * 0.60f, lr.Width, lr.Height * 0.34f), fmt);
+                        var sub = new RectangleF(lr.X + 6, lr.Y + lr.Height * 0.60f, lr.Width - 12, lr.Height * 0.34f);
+                        using (var f2 = FitFont(g, TileLabels[i], 20f, 10f, sub.Size, fmt))
+                            g.DrawString(TileLabels[i], f2, white, sub, fmt);
                     } else {
                         // text-forward nav tiles (her spec: text over symbols, large type)
-                        using (var f = new Font("Segoe UI", 30, FontStyle.Bold))
-                            g.DrawString(TileLabels[i], f, white, new RectangleF(lr.X + 8, lr.Y, lr.Width - 16, lr.Height), fmt);
+                        var full = new RectangleF(lr.X + 8, lr.Y + 6, lr.Width - 16, lr.Height - 12);
+                        using (var f = FitFont(g, TileLabels[i], 30f, 14f, full.Size, fmt))
+                            g.DrawString(TileLabels[i], f, white, full, fmt);
                     }
                 }
                 if (i == hover && prog > 0) {   // dwell progress: teal bar along the tile bottom
