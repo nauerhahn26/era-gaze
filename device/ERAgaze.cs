@@ -1389,10 +1389,13 @@ static class Program {
         if (preferPicker && ForegroundPickerKiosk(dir)) {
             Log.W("watch-end: streaming kiosk closed; picker kiosk foregrounded"); return;
         }
-        if (!string.IsNullOrEmpty(Cfg.ForegroundApp))
-            try { System.Diagnostics.Process.Start("explorer.exe", Cfg.ForegroundApp); } catch { }
-        Log.W("watch-end: streaming kiosk closed; " +
-              (string.IsNullOrEmpty(Cfg.ForegroundApp) ? "no foreground app configured" : "foregrounded " + Cfg.ForegroundApp));
+        // "all done" = finished watching ENTIRELY: sweep every kiosk (the picker
+        // included — 8/28 tablet build test: killing only the streaming kiosk left
+        // the fullscreen picker sitting above TD Snap) and hand the screen to the
+        // ForegroundApp via the proven exit-door path.
+        ExitKiosks();
+        Log.W("watch-end: all kiosks closed (all-done sweep); " +
+              (string.IsNullOrEmpty(Cfg.ForegroundApp) ? "no foreground app configured" : "foregrounding " + Cfg.ForegroundApp));
     }
 
     // Any OTHER RaeGaze kiosk chrome still running (matched like ExitKiosks: BaseDir name
