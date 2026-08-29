@@ -1142,6 +1142,23 @@ static class Watch {
         for (int i = 0; i < tiles.Length; i++)
             if (tiles[i].Contains(box.X + x, box.Y + y)) { lastFire = DateTime.Now; Fire(i); break; }
     }
+    // Touch/caregiver parity via the LOW-LEVEL HOOK, not WinForms messages: the
+    // 8/28 i13 QA showed clicks never reach the layered NOACTIVATE overlays
+    // (tablet mouse-sim masked it — the moving cursor fed the gaze-dwell path).
+    // The hook demonstrably sees every untagged click with screen coords, so it
+    // is the tap channel. Runs on the hooking (UI) thread.
+    public static void HumanClick(int sx, int sy) {
+        if (!Active) return;
+        if (strip) {
+            Rectangle box; var tiles = TileRects(out box);
+            lastInteract = DateTime.Now;
+            for (int i = 0; i < tiles.Length; i++)
+                if (tiles[i].Contains(sx, sy)) { lastFire = DateTime.Now; Log.W("watch: strip tap tile " + i); Fire(i); break; }
+        } else if (WakeRect().Contains(sx, sy)) {
+            Log.W("watch: wake tap");
+            ShowStrip(DateTime.Now);
+        }
+    }
 
     // ---- geometry + drawing ----
     static Rectangle[] TileRects(out Rectangle box) {
@@ -1501,7 +1518,10 @@ static class Program {
     static IntPtr HookCb(int code, IntPtr w, IntPtr l) {
         if (code >= 0) {
             var s = (MSLL)Marshal.PtrToStructure(l, typeof(MSLL));
-            if (s.extra != Native.SIG) yieldUntil = DateTime.Now.AddMilliseconds(Cfg.YieldMs); // real finger/mouse
+            if (s.extra != Native.SIG) {
+                yieldUntil = DateTime.Now.AddMilliseconds(Cfg.YieldMs); // real finger/mouse
+                if ((int)w == 0x0201) Watch.HumanClick(s.x, s.y);       // WM_LBUTTONDOWN -> watch tap channel
+            }
         }
         return CallNextHookEx(hookH, code, w, l);
     }
