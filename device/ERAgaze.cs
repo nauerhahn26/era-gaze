@@ -118,6 +118,7 @@ static class Cfg {
     public static string WatchWakeCorner = "auto";  // auto = corner OPPOSITE the park corner; tl/tr/bl/br to pin
     public static int WatchTilePx = 210;            // options-strip tile square, px
     public static int WatchVolSteps = 5;            // VK_VOLUME_* presses per activation (each ~2 units)
+    public static int WatchFeedbackPct = 15;        // wake-corner feedback region, % of screen width (dad 8/28)
     public static string StreamingDir() {
         return string.IsNullOrEmpty(StreamingProfileDir) ? Path.Combine(BaseDir, "streaming-profile") : StreamingProfileDir;
     }
@@ -189,6 +190,7 @@ static class Cfg {
             WatchWakeCorner = S(d, "WatchWakeCorner", WatchWakeCorner).ToLowerInvariant();
             WatchTilePx = Math.Max(120, I(d, "WatchTilePx", WatchTilePx));
             WatchVolSteps = Math.Max(1, Math.Min(20, I(d, "WatchVolSteps", WatchVolSteps)));
+            WatchFeedbackPct = Math.Max(5, Math.Min(40, I(d, "WatchFeedbackPct", WatchFeedbackPct)));
             ForegroundApp = S(d, "ForegroundApp", ForegroundApp);   // "" is a valid value (foreground nothing)
             object dv;   // "DenyApps" (v2.4 public name) wins; "deny" kept so existing device configs keep working
             if ((d.TryGetValue("DenyApps", out dv) || d.TryGetValue("deny", out dv)) && dv is System.Collections.ArrayList) {
@@ -240,7 +242,7 @@ static class Cfg {
 "  \"_doc4\": \"Volume cap: ships OFF — opt in per device. true = master volume above VolCapLevel is clamped back down (mute + volume-down never touched).\",\n" +
 "  \"VolCapEnabled\": false,\n" +
 "  \"VolCapLevel\": 55,\n" +
-"  \"_doc5\": \"Watch mode (movie player): StreamingProfileDir '' = <BaseDir>\\\\streaming-profile; ChromePath '' = auto-detect; WatchWakeCorner auto = opposite the park corner; WatchWakeDwellMs floors at 1600 (nav tier); WatchDismissMs = options-strip auto-dismiss.\",\n" +
+"  \"_doc5\": \"Watch mode (movie player): StreamingProfileDir '' = <BaseDir>\\\\streaming-profile; ChromePath '' = auto-detect; WatchWakeCorner auto = opposite the park corner; WatchWakeDwellMs floors at 1600 (nav tier); WatchDismissMs = options-strip auto-dismiss; WatchFeedbackPct = wake-corner region (% screen width) where the cursor+ring return as gaze feedback.\",\n" +
 "  \"StreamingProfileDir\": \"\",\n" +
 "  \"ChromePath\": \"\",\n" +
 "  \"WatchDismissMs\": 20000,\n" +
@@ -961,6 +963,22 @@ static class Watch {
     public static void CreateOverlays() {   // UI thread (Ov.Load) ONLY
         wakeOv = new Overlay(true); wakeOv.Tap += WakeTap; wakeOv.Show(); wakeOv.SetFrame(Blank(), -100, -100);
         stripOv = new Overlay(true); stripOv.Tap += StripTap; stripOv.Show(); stripOv.SetFrame(Blank(), -100, -100);
+        // RE-ARM ACROSS RESTART (8/28: an engine swap mid-movie must not strand her
+        // without the escape overlay): a streaming kiosk already running = watch on.
+        System.Threading.ThreadPool.QueueUserWorkItem(delegate {
+            try {
+                string dir = Cfg.StreamingDir();
+                foreach (var p in System.Diagnostics.Process.GetProcessesByName("chrome")) {
+                    try {
+                        if (Program.CmdLineOf(p.Id).Contains(dir)) {
+                            Begin(dir, "(re-armed)", p.Id);
+                            Log.W("watch mode RE-ARMED on boot (streaming kiosk pid=" + p.Id + " already running)");
+                            return;
+                        }
+                    } catch { }
+                }
+            } catch { }
+        });
     }
 
     public static void Begin(string dir, string titleId, int pid) {   // bus thread
@@ -987,7 +1005,30 @@ static class Watch {
 
     // Cursor+ring suppression over the streaming kiosk — the DenyApps mechanism extended
     // to one specific chrome (matched per-PID, cached; DenyApps itself matches by name).
-    public static bool CursorSuppressed() { return Active && ForegroundIsKiosk(); }
+    // FEEDBACK EXCEPTIONS (dad 8/28, live Lion King test: "looking at the corner, no
+    // response" — with the cursor suppressed there is NOTHING telling her where the
+    // tracker sees her eyes, so a small calibration offset is indistinguishable from
+    // a dead feature): the familiar cursor+ring COMES BACK (a) whenever fresh gaze is
+    // inside the wake-corner feedback region, so she can steer onto the target, and
+    // (b) the whole time the strip is up, until it fades. Watching stays clean —
+    // mid-screen gaze on the video shows nothing.
+    public static bool CursorSuppressed() {
+        if (!Active || !ForegroundIsKiosk()) return false;
+        if (strip) return false;
+        double gx, gy;
+        if (Program.ReadFreshGaze(out gx, out gy) &&
+            FeedbackRegion().Contains((int)gx, (int)gy)) return false;
+        return true;
+    }
+    static Rectangle FeedbackRegion() {
+        int sw = Program.ScreenW, sh = Program.ScreenH;
+        int s = Math.Max(Cfg.WatchWakeSizePx * 2,
+                         (int)(sw * Cfg.WatchFeedbackPct / 100.0));
+        Rectangle w = WakeRect();
+        int x = (w.X <= sw / 2) ? 0 : sw - s;
+        int y = (w.Y <= sh / 2) ? 0 : sh - s;
+        return new Rectangle(x, y, s, s);
+    }
 
     static bool ForegroundIsKiosk() {   // UI thread; WMI lookup only on first sight of a pid
         uint pid; Native.GetWindowThreadProcessId(Native.GetForegroundWindow(), out pid);
