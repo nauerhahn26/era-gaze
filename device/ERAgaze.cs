@@ -36,8 +36,8 @@
 //   global dwell-click stays OFF as always). A small corner WAKE TARGET — placed OPPOSITE
 //   the track-loss park corner and gated on fresh validity==1 bus samples ONLY, never
 //   cursor position — dwell-reveals an OPTIONS STRIP over the STILL-PLAYING video
-//   (play/pause + volume via synthesized media keys, pick another, all done; auto-dismiss
-//   "WatchDismissMs", default 20s). POST /app/watch-end closes ONLY the streaming kiosk
+//   (D57c: exit-to-picker + play/pause + volume top row, restart/next-episode rail; auto-dismiss
+//   "WatchDismissMs", default 15s). POST /app/watch-end closes ONLY the streaming kiosk
 //   and reveals the picker. Keyboard INPUT synthesis added to Native (x64 layout).
 //   /app/watch-heartbeat = logging stub for the MV3 companion extension (extension/).
 //
@@ -933,7 +933,7 @@ sealed class Bus {
 //      strictest wins, no coordination needed), pick another (close the streaming
 //      kiosk -> picker), all done (close -> ForegroundApp). Tiles fire on content-tier
 //      dwell (Cfg.DwellMs) and are also plain-clickable (caregiver touch parity).
-//      No interaction for WatchDismissMs (default 20s — her >=20s response profile)
+//      No interaction for WatchDismissMs (default 15s — her >=20s response profile)
 //      -> the strip melts away, the wake target returns, the video is untouched.
 //
 // SAFETY PROPERTY #1 (the reason this class is shaped the way it is): dwell accumulation
