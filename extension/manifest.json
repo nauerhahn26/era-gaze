@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "New ERA Watch Companion",
+  "version": "0.1.0",
+  "description": "Thin companion for ERAgaze watch mode: playback watchdog heartbeat and end-of-episode detection, posted to the local gaze bus (127.0.0.1:49155). v1 skeleton.",
+  "background": { "service_worker": "background.js" },
+  "host_permissions": ["http://127.0.0.1:49155/*"],
+  "content_scripts": [
+    {
+      "matches": ["*://*.netflix.com/*"],
+      "js": ["content/netflix.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["*://*.disneyplus.com/*"],
+      "js": ["content/disney.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["*://*.primevideo.com/*", "*://*.amazon.com/*"],
+      "js": ["content/prime.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

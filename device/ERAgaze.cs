@@ -31,6 +31,16 @@
 //   "ForegroundApp" (the shell: URI /app/exit hands the screen back to; default TD Snap),
 //   "DenyApps" (foreground processes where the cursor steps aside; default Tobii/Snap list).
 //
+// v2.5: movie-player WATCH MODE (D57/D57a) — POST /app/launch spawns a streaming-service
+//   Chrome kiosk (own profile) and suppresses cursor+ring over it (bus keeps streaming;
+//   global dwell-click stays OFF as always). A small corner WAKE TARGET — placed OPPOSITE
+//   the track-loss park corner and gated on fresh validity==1 bus samples ONLY, never
+//   cursor position — dwell-reveals an OPTIONS STRIP over the STILL-PLAYING video
+//   (play/pause + volume via synthesized media keys, pick another, all done; auto-dismiss
+//   "WatchDismissMs", default 20s). POST /app/watch-end closes ONLY the streaming kiosk
+//   and reveals the picker. Keyboard INPUT synthesis added to Native (x64 layout).
+//   /app/watch-heartbeat = logging stub for the MV3 companion extension (extension/).
+//
 // Sources:  --source=gaze (default) | --source=mouse (simulation without eyes)
 // Config:   <BaseDir>\ERAgaze.json (created with defaults on first run;
 //           edits apply live within ~2s). CLI flags override the file for that run.
@@ -99,6 +109,19 @@ static class Cfg {
     public static bool VolCapEnabled = false;
     public static int VolCapLevel = 55;      // clamp target, 0-100 (% of master volume)
 
+    // ---- movie-player watch mode (v2.5, D57) ----
+    public static string StreamingProfileDir = "";  // "" = <BaseDir>\streaming-profile
+    public static string ChromePath = "";           // "" = auto-detect the standard Chrome installs
+    public static int WatchDismissMs = 20000;       // options-strip auto-dismiss (her >=20s response profile)
+    public static int WatchWakeDwellMs = 1600;      // wake dwell — nav tier; LoadFile floors this at 1600
+    public static int WatchWakeSizePx = 120;        // corner wake-target square, px
+    public static string WatchWakeCorner = "auto";  // auto = corner OPPOSITE the park corner; tl/tr/bl/br to pin
+    public static int WatchTilePx = 210;            // options-strip tile square, px
+    public static int WatchVolSteps = 5;            // VK_VOLUME_* presses per activation (each ~2 units)
+    public static string StreamingDir() {
+        return string.IsNullOrEmpty(StreamingProfileDir) ? Path.Combine(BaseDir, "streaming-profile") : StreamingProfileDir;
+    }
+
     // ---- dwell-click extras (opt-in only) ----
     public static int Radius = 26;           // ring visual radius
     public static int Tol = 55;              // dwell target wander tolerance
@@ -157,6 +180,15 @@ static class Cfg {
             Bus = B(d, "bus", Bus); Port = I(d, "port", Port);
             VolCapEnabled = B(d, "VolCapEnabled", VolCapEnabled);
             VolCapLevel = Math.Max(0, Math.Min(100, I(d, "VolCapLevel", VolCapLevel)));
+            StreamingProfileDir = S(d, "StreamingProfileDir", StreamingProfileDir);
+            ChromePath = S(d, "ChromePath", ChromePath);
+            WatchDismissMs = Math.Max(3000, I(d, "WatchDismissMs", WatchDismissMs));
+            // nav-tier floor: config may SLOW the wake, never quicken it past the tier
+            WatchWakeDwellMs = Math.Max(1600, I(d, "WatchWakeDwellMs", WatchWakeDwellMs));
+            WatchWakeSizePx = Math.Max(48, I(d, "WatchWakeSizePx", WatchWakeSizePx));
+            WatchWakeCorner = S(d, "WatchWakeCorner", WatchWakeCorner).ToLowerInvariant();
+            WatchTilePx = Math.Max(120, I(d, "WatchTilePx", WatchTilePx));
+            WatchVolSteps = Math.Max(1, Math.Min(20, I(d, "WatchVolSteps", WatchVolSteps)));
             ForegroundApp = S(d, "ForegroundApp", ForegroundApp);   // "" is a valid value (foreground nothing)
             object dv;   // "DenyApps" (v2.4 public name) wins; "deny" kept so existing device configs keep working
             if ((d.TryGetValue("DenyApps", out dv) || d.TryGetValue("deny", out dv)) && dv is System.Collections.ArrayList) {
@@ -208,6 +240,15 @@ static class Cfg {
 "  \"_doc4\": \"Volume cap: ships OFF — opt in per device. true = master volume above VolCapLevel is clamped back down (mute + volume-down never touched).\",\n" +
 "  \"VolCapEnabled\": false,\n" +
 "  \"VolCapLevel\": 55,\n" +
+"  \"_doc5\": \"Watch mode (movie player): StreamingProfileDir '' = <BaseDir>\\\\streaming-profile; ChromePath '' = auto-detect; WatchWakeCorner auto = opposite the park corner; WatchWakeDwellMs floors at 1600 (nav tier); WatchDismissMs = options-strip auto-dismiss.\",\n" +
+"  \"StreamingProfileDir\": \"\",\n" +
+"  \"ChromePath\": \"\",\n" +
+"  \"WatchDismissMs\": 20000,\n" +
+"  \"WatchWakeDwellMs\": 1600,\n" +
+"  \"WatchWakeSizePx\": 120,\n" +
+"  \"WatchWakeCorner\": \"auto\",\n" +
+"  \"WatchTilePx\": 210,\n" +
+"  \"WatchVolSteps\": 5,\n" +
 "}\n");
         } catch (Exception ex) { Log.W("config write failed: " + ex.Message); }
     }
@@ -338,13 +379,31 @@ sealed class Overlay : Form {
     [DllImport("gdi32.dll")] static extern bool DeleteDC(IntPtr dc);
     [DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr o);
 
-    public Overlay() {
+    // clickable=true (v2.5 watch-mode surfaces): WS_EX_TRANSPARENT is omitted so real
+    // taps/clicks land on OPAQUE pixels (layered windows hit-test per-pixel alpha —
+    // fully transparent areas still pass through to the app below). WS_EX_NOACTIVATE
+    // stays: a caregiver tap never steals focus from the kiosk underneath.
+    readonly bool clickable;
+    public Overlay() : this(false) { }
+    public Overlay(bool clickable) {
+        this.clickable = clickable;
         FormBorderStyle = FormBorderStyle.None; ShowInTaskbar = false; StartPosition = FormStartPosition.Manual;
         TopMost = true; Bounds = new Rectangle(-100, -100, 8, 8);
     }
     protected override bool ShowWithoutActivation { get { return true; } }
     protected override CreateParams CreateParams {
-        get { var c = base.CreateParams; c.ExStyle |= WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE; return c; }
+        get {
+            var c = base.CreateParams;
+            c.ExStyle |= WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
+            if (!clickable) c.ExStyle |= WS_EX_TRANSPARENT;
+            return c;
+        }
+    }
+    // Touch parity for caregivers (clickable overlays only): raised with CLIENT coords.
+    public event Action<int, int> Tap;
+    protected override void OnMouseClick(MouseEventArgs e) {
+        base.OnMouseClick(e);
+        var t = Tap; if (t != null) t(e.X, e.Y);
     }
     public void SetFrame(Bitmap bmp, int x, int y) {
         IntPtr screenDc = GetDC(IntPtr.Zero), memDc = CreateCompatibleDC(screenDc), hBmp = IntPtr.Zero, old = IntPtr.Zero;
@@ -398,6 +457,24 @@ static class Native {
         try { uint pid; GetWindowThreadProcessId(GetForegroundWindow(), out pid);
             return System.Diagnostics.Process.GetProcessById((int)pid).ProcessName.ToLowerInvariant(); }
         catch { return ""; }
+    }
+
+    // ---- keyboard INPUT synthesis (v2.5 watch mode: media/volume keys) ----
+    // Media keys are focus-independent: Chrome 73+ routes VK_MEDIA_PLAY_PAUSE to the
+    // active media session even when the window is unfocused (research §2). Layout is
+    // x64-ONLY by design: the INPUT union sits at offset 8 and the struct is padded to
+    // the same 40-byte native sizeof(INPUT) the mouse path uses — the build line in the
+    // header pins /platform:x64, so this never runs 32-bit.
+    [StructLayout(LayoutKind.Sequential)] public struct KInput { public ushort wVk, wScan; public uint flags, time; public IntPtr extra; }
+    [StructLayout(LayoutKind.Explicit, Size = 40)] public struct INPUTK { [FieldOffset(0)] public uint type; [FieldOffset(8)] public KInput ki; }
+    [DllImport("user32.dll")] public static extern uint SendInput(uint n, INPUTK[] p, int cb);
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+    public const ushort VK_MEDIA_PLAY_PAUSE = 0xB3, VK_VOLUME_UP = 0xAF, VK_VOLUME_DOWN = 0xAE;
+    const uint KEY_EXTENDED = 0x0001, KEY_UP = 0x0002;
+    public static void Key(ushort vk) {   // full press: down + up (media/volume keys are extended keys)
+        var dn = new INPUTK { type = 1 }; dn.ki = new KInput { wVk = vk, flags = KEY_EXTENDED };
+        var up = new INPUTK { type = 1 }; up.ki = new KInput { wVk = vk, flags = KEY_EXTENDED | KEY_UP };
+        SendInput(2, new[] { dn, up }, Marshal.SizeOf(typeof(INPUTK)));
     }
 }
 
@@ -551,6 +628,7 @@ sealed class Bus {
     volatile bool running;
     public volatile string StatusExtra = "";  // service state merged into /status (set by Program)
     public long Sent;
+    DateTime lastHbLog = DateTime.MinValue;   // /app/watch-heartbeat log rate limit
 
     public bool Start() {
         try {
@@ -601,6 +679,98 @@ sealed class Bus {
                         ctx.Response.ContentLength64 = rp.Length;
                         ctx.Response.OutputStream.Write(rp, 0, rp.Length);
                         ctx.Response.Close();
+                    } else { ctx.Response.StatusCode = 405; ctx.Response.Close(); }
+                } else if (ctx.Request.Url.AbsolutePath.StartsWith("/app/launch")) {
+                    // WATCH LAUNCH (v2.5 movie-player): {"url","watch":true,"titleId"?,"profile"?}
+                    // ("episode" and other extra fields are accepted and ignored). Spawns the
+                    // streaming Chrome kiosk on its own profile (EllieMusic.bat flag set, url
+                    // last) and, watch:true, arms watch mode. Board tiles call this exactly like
+                    // /app/exit (LNA policy already pre-allows 49155). CONTRACT: the board posts
+                    // as a CORS simple request — JSON body with NO Content-Type header — so the
+                    // body is parsed unconditionally, never gated on the header. Reply FIRST
+                    // (200 = accepted); the spawn itself runs off-thread.
+                    ctx.Response.AddHeader("Access-Control-Allow-Origin", "*");
+                    ctx.Response.AddHeader("Access-Control-Allow-Headers", "Content-Type");
+                    if (ctx.Request.HttpMethod == "OPTIONS") { ctx.Response.StatusCode = 204; ctx.Response.Close(); }
+                    else if (ctx.Request.HttpMethod == "POST") {
+                        string url = "", titleId = "", profile = ""; bool watch = false;
+                        try {
+                            string bodyIn;
+                            using (var sr = new StreamReader(ctx.Request.InputStream, ctx.Request.ContentEncoding)) bodyIn = sr.ReadToEnd();
+                            var d = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(bodyIn);
+                            if (d != null) {
+                                object v;
+                                if (d.TryGetValue("url", out v)) url = Convert.ToString(v) ?? "";
+                                if (d.TryGetValue("watch", out v)) watch = Convert.ToBoolean(v);
+                                if (d.TryGetValue("titleId", out v)) titleId = Convert.ToString(v) ?? "";
+                                if (d.TryGetValue("profile", out v)) profile = Convert.ToString(v) ?? "";
+                            }
+                        } catch { }
+                        // http(s) only; no quotes/whitespace — the url lands on a command line
+                        bool okReq = (url.StartsWith("https://") || url.StartsWith("http://")) &&
+                                     url.IndexOf('"') < 0 && url.IndexOf(' ') < 0 &&
+                                     Program.ValidProfileName(profile);
+                        byte[] rl = Encoding.UTF8.GetBytes(okReq
+                            ? "{\"ok\":true,\"watch\":" + (watch ? "true" : "false") + ",\"launching\":true}"
+                            : "{\"ok\":false}");
+                        ctx.Response.StatusCode = okReq ? 200 : 400;
+                        ctx.Response.ContentType = "application/json";
+                        ctx.Response.ContentLength64 = rl.Length;
+                        ctx.Response.OutputStream.Write(rl, 0, rl.Length);
+                        ctx.Response.Close();
+                        if (okReq) {
+                            string u2 = url, t2 = titleId, p2 = profile; bool w2 = watch;
+                            System.Threading.ThreadPool.QueueUserWorkItem(delegate { Program.LaunchStreamingKiosk(u2, w2, t2, p2); });
+                        }
+                    } else { ctx.Response.StatusCode = 405; ctx.Response.Close(); }
+                } else if (ctx.Request.Url.AbsolutePath.StartsWith("/app/watch-heartbeat")) {
+                    // v1 STUB: the MV3 companion extension posts {service,title,t,playing} every
+                    // ~10s. Logged (rate-limited to one line / 30s) and acked; a later rev grows
+                    // a liveness watchdog + hub movie-event bridge here. Body parsed/logged
+                    // unconditionally — never gated on Content-Type.
+                    ctx.Response.AddHeader("Access-Control-Allow-Origin", "*");
+                    ctx.Response.AddHeader("Access-Control-Allow-Headers", "Content-Type");
+                    if (ctx.Request.HttpMethod == "OPTIONS") { ctx.Response.StatusCode = 204; ctx.Response.Close(); }
+                    else if (ctx.Request.HttpMethod == "POST") {
+                        string hb = "";
+                        try { using (var sr = new StreamReader(ctx.Request.InputStream, ctx.Request.ContentEncoding)) hb = sr.ReadToEnd(); } catch { }
+                        if ((DateTime.Now - lastHbLog).TotalSeconds >= 30) {
+                            lastHbLog = DateTime.Now;
+                            Log.W("watch heartbeat: " + (hb.Length > 200 ? hb.Substring(0, 200) : hb));
+                        }
+                        byte[] rh = Encoding.UTF8.GetBytes("{\"ok\":true}");
+                        ctx.Response.StatusCode = 200;
+                        ctx.Response.ContentType = "application/json";
+                        ctx.Response.ContentLength64 = rh.Length;
+                        ctx.Response.OutputStream.Write(rh, 0, rh.Length);
+                        ctx.Response.Close();
+                    } else { ctx.Response.StatusCode = 405; ctx.Response.Close(); }
+                } else if (ctx.Request.Url.AbsolutePath.StartsWith("/app/watch-end")) {
+                    // WATCH END: extension end-detection or a board door. Reply FIRST (the caller
+                    // may die with its kiosk), then close ONLY the streaming kiosk — the picker
+                    // kiosk survives and is foregrounded (ForegroundApp when none is running).
+                    ctx.Response.AddHeader("Access-Control-Allow-Origin", "*");
+                    ctx.Response.AddHeader("Access-Control-Allow-Headers", "Content-Type");
+                    if (ctx.Request.HttpMethod == "OPTIONS") { ctx.Response.StatusCode = 204; ctx.Response.Close(); }
+                    else if (ctx.Request.HttpMethod == "POST") {
+                        string reason = "watch-end";
+                        try {
+                            string bodyIn;
+                            using (var sr = new StreamReader(ctx.Request.InputStream, ctx.Request.ContentEncoding)) bodyIn = sr.ReadToEnd();
+                            var d = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(bodyIn);
+                            object v;
+                            if (d != null && d.TryGetValue("reason", out v)) {
+                                string s2 = Convert.ToString(v); if (!string.IsNullOrEmpty(s2)) reason = s2;
+                            }
+                        } catch { }
+                        byte[] re = Encoding.UTF8.GetBytes("{\"ok\":true,\"ending\":true}");
+                        ctx.Response.StatusCode = 200;
+                        ctx.Response.ContentType = "application/json";
+                        ctx.Response.ContentLength64 = re.Length;
+                        ctx.Response.OutputStream.Write(re, 0, re.Length);
+                        ctx.Response.Close();
+                        Log.W("/app/watch-end (" + reason + ")");
+                        Watch.EndAndClose(true, reason);
                     } else { ctx.Response.StatusCode = 405; ctx.Response.Close(); }
                 } else if (ctx.Request.Url.AbsolutePath.StartsWith("/app/exit")) {
                     // EXIT DOOR (phase 4.1): a web kiosk hands the screen back to the AAC app.
@@ -703,7 +873,7 @@ sealed class Bus {
     }
 
     string BuildStatus() {
-        return "{\"device\":\"tobii\",\"service\":\"eragaze\",\"version\":\"2.4\"," +
+        return "{\"device\":\"tobii\",\"service\":\"eragaze\",\"version\":\"2.5\"," +
                "\"paused\":" + (Cfg.Paused ? "true" : "false") + "," +
                "\"connected\":" + (Program.TrackerConnected ? "true" : "false") + "," +
                "\"clients\":" + CountClients() + ",\"sent\":" + Interlocked.Read(ref Sent) +
@@ -738,13 +908,349 @@ sealed class Bus {
     }
 }
 
+// =====================================================================================
+// WATCH MODE (v2.5, movie-player, D57/D57a). While a streaming-service kiosk (Netflix/
+// Disney+/Prime in Chrome --kiosk on its own profile) is foreground, the whole screen is
+// inert: cursor + ring suppressed (Program.Suppressed() consults CursorSuppressed below —
+// the DenyApps mechanism extended per-process), global dwell-click stays OFF as always,
+// and the gaze bus keeps streaming. The only active surfaces are two layered overlays:
+//   1. a small WAKE TARGET in the corner OPPOSITE the track-loss park corner. A long
+//      nav-tier dwell (>= 1600ms) reveals:
+//   2. the OPTIONS STRIP over the STILL-PLAYING video (D57: wake is never an action —
+//      the video never pauses or flinches on wake): pause/play (VK_MEDIA_PLAY_PAUSE,
+//      toggle semantics, deliberately NO state model), volume up/down (VK_VOLUME_UP/
+//      VK_VOLUME_DOWN — the volume cap stays the hard ceiling; it clamps ABOVE us,
+//      strictest wins, no coordination needed), pick another (close the streaming
+//      kiosk -> picker), all done (close -> ForegroundApp). Tiles fire on content-tier
+//      dwell (Cfg.DwellMs) and are also plain-clickable (caregiver touch parity).
+//      No interaction for WatchDismissMs (default 20s — her >=20s response profile)
+//      -> the strip melts away, the wake target returns, the video is untouched.
+//
+// SAFETY PROPERTY #1 (the reason this class is shaped the way it is): dwell accumulation
+// on the wake target and on strip tiles is gated EXCLUSIVELY on FRESH validity==1
+// gaze-bus samples (Program.ReadFreshGaze). The OS cursor position is NEVER consulted,
+// so the track-loss park — which MOVES THE CURSOR to a rest corner precisely when her
+// eyes are absent — is STRUCTURALLY unable to accumulate dwell anywhere: no fresh valid
+// samples, no progress. Placing the wake corner opposite the park corner is defense in
+// depth, not the mechanism.
+//
+// Threading: Begin/Deactivate/EndAndClose may be called from bus (HTTP) threads and only
+// flip state under `gate`; every window operation (create/draw/hide) happens on the
+// WinForms UI thread inside Tick() and the Tap handlers. CreateOverlays runs once in
+// Ov.Load (UI thread), so the overlay windows are born on the message-loop thread.
+static class Watch {
+    public static volatile bool Active;             // watch mode armed (streaming kiosk launched)
+    static volatile bool strip;                     // options strip visible (else wake target)
+    static string profileDir = "";                  // exact --user-data-dir of the streaming kiosk
+    static int kioskPid;                            // browser pid from Process.Start (fast-path match)
+    static readonly object gate = new object();     // guards profileDir/kioskPid/fgCache across threads
+    static readonly Dictionary<int, bool> fgCache = new Dictionary<int, bool>();  // pid -> is-our-kiosk
+
+    // UI-thread-only state
+    static Overlay wakeOv, stripOv;
+    static bool wakeArmed; static DateTime wakeStart;
+    static int hoverIdx = -1; static DateTime hoverStart;
+    static int mustLeaveIdx = -1;                   // fired tile: re-arms only after gaze leaves it
+    static DateTime lastFire = DateTime.MinValue, lastInteract;
+    static int tmTick;                              // ReassertTopmost cadence (same ~480ms as the ring)
+    const int HIDDEN = int.MinValue;
+    static int lastWakeKey = HIDDEN, lastStripKey = HIDDEN;   // dirty keys: skip redundant redraws
+
+    static Bitmap Blank() { return new Bitmap(2, 2, PixelFormat.Format32bppArgb); }
+
+    public static void CreateOverlays() {   // UI thread (Ov.Load) ONLY
+        wakeOv = new Overlay(true); wakeOv.Tap += WakeTap; wakeOv.Show(); wakeOv.SetFrame(Blank(), -100, -100);
+        stripOv = new Overlay(true); stripOv.Tap += StripTap; stripOv.Show(); stripOv.SetFrame(Blank(), -100, -100);
+    }
+
+    public static void Begin(string dir, string titleId, int pid) {   // bus thread
+        lock (gate) { profileDir = dir; kioskPid = pid; fgCache.Clear(); }
+        strip = false; Active = true;
+        Log.W("watch mode ON profile=" + dir + (string.IsNullOrEmpty(titleId) ? "" : " title=" + titleId) + " pid=" + pid);
+    }
+
+    public static void Deactivate(string why) {     // any thread: state only, no window ops
+        bool was = Active; Active = false; strip = false;
+        lock (gate) { fgCache.Clear(); }
+        if (was) Log.W("watch mode OFF (" + why + ")");
+    }
+
+    // End watch mode and close the streaming kiosk (reply-first callers queue the heavy
+    // part off-thread). preferPicker: foreground the picker kiosk if one is running.
+    public static void EndAndClose(bool preferPicker, string reason) {
+        string dir; lock (gate) { dir = Active ? profileDir : ""; }
+        if (dir.Length == 0) dir = Cfg.StreamingDir();   // stray-kiosk cleanup even if watch was off
+        Deactivate(reason);
+        string d2 = dir; bool pp = preferPicker;
+        System.Threading.ThreadPool.QueueUserWorkItem(delegate { Program.CloseStreamingKiosk(d2, pp); });
+    }
+
+    // Cursor+ring suppression over the streaming kiosk — the DenyApps mechanism extended
+    // to one specific chrome (matched per-PID, cached; DenyApps itself matches by name).
+    public static bool CursorSuppressed() { return Active && ForegroundIsKiosk(); }
+
+    static bool ForegroundIsKiosk() {   // UI thread; WMI lookup only on first sight of a pid
+        uint pid; Native.GetWindowThreadProcessId(Native.GetForegroundWindow(), out pid);
+        if (pid == 0) return false;
+        int p = (int)pid; string dir;
+        lock (gate) {
+            if (p == kioskPid) return true;
+            bool v; if (fgCache.TryGetValue(p, out v)) return v;
+            dir = profileDir;
+        }
+        bool isK = false;
+        try {
+            var pr = System.Diagnostics.Process.GetProcessById(p);
+            if (pr.ProcessName.ToLowerInvariant() == "chrome" && dir.Length > 0)
+                isK = Program.CmdLineOf(p).IndexOf(dir, StringComparison.OrdinalIgnoreCase) >= 0;
+        } catch { }
+        lock (gate) { fgCache[p] = isK; }
+        return isK;
+    }
+
+    // Hide both frames without ending watch mode (paused, or kiosk lost the foreground).
+    public static void HideFrames() {   // UI thread
+        if (wakeOv == null) return;
+        HideWake(); HideStripFrame();
+    }
+    static void HideWake() {
+        if (lastWakeKey != HIDDEN) { wakeOv.SetFrame(Blank(), -100, -100); lastWakeKey = HIDDEN; }
+        wakeArmed = false;
+    }
+    static void HideStripFrame() {
+        if (lastStripKey != HIDDEN) { stripOv.SetFrame(Blank(), -100, -100); lastStripKey = HIDDEN; }
+        hoverIdx = -1; mustLeaveIdx = -1;
+    }
+    static void DismissStrip(string why) {
+        strip = false; HideStripFrame();
+        Log.W("watch: strip dismissed (" + why + ") -> wake target returns; video untouched");
+    }
+
+    // Main pump: called from Program.Tick every 16ms, BEFORE the Suppressed() early
+    // return — running while the cursor is suppressed is this class's whole job.
+    public static void Tick(DateTime now) {   // UI thread
+        if (wakeOv == null) return;                          // overlays not created yet
+        if (!Active) { HideFrames(); return; }
+        if (++tmTick >= 30) { tmTick = 0; wakeOv.ReassertTopmost(); stripOv.ReassertTopmost(); }
+        if (!ForegroundIsKiosk()) { HideFrames(); return; }  // picker/TD Snap on top: step aside
+        double gx, gy; bool fresh = Program.ReadFreshGaze(out gx, out gy);
+        if (strip) StripTick(now, fresh, gx, gy);
+        else WakeTick(now, fresh, gx, gy);
+    }
+
+    // Corner OPPOSITE the track-loss park corner (defense in depth; see class comment).
+    // "auto" derives it from the LIVE park config (incl. /app/park overrides); explicit
+    // tl/tr/bl/br pins it for QA.
+    static Rectangle WakeRect() {
+        int s = Cfg.WatchWakeSizePx, m = 8, sw = Program.ScreenW, sh = Program.ScreenH;
+        string c = Cfg.WatchWakeCorner;
+        if (c != "tl" && c != "tr" && c != "bl" && c != "br") {
+            double pkx = Cfg.ParkOvX ?? Cfg.ParkX01, pky = Cfg.ParkOvY ?? Cfg.ParkY01;
+            c = (pky >= 0.5 ? "t" : "b") + (pkx >= 0.5 ? "l" : "r");
+        }
+        int x = c.EndsWith("l") ? m : sw - s - m;
+        int y = c.StartsWith("t") ? m : sh - s - m;
+        return new Rectangle(x, y, s, s);
+    }
+
+    static void WakeTick(DateTime now, bool fresh, double gx, double gy) {
+        HideStripFrame();
+        Rectangle r = WakeRect();
+        // SAFETY: accumulate ONLY while fresh validity==1 samples land inside the target.
+        // Anything else — stale samples, validity 0, track loss (= parked cursor) — resets.
+        if (fresh && r.Contains((int)gx, (int)gy)) {
+            if (!wakeArmed) { wakeArmed = true; wakeStart = now; }
+        } else wakeArmed = false;
+        double prog = wakeArmed ? (now - wakeStart).TotalMilliseconds / Cfg.WatchWakeDwellMs : 0;
+        if (prog >= 1.0) { wakeArmed = false; ShowStrip(now); return; }
+        DrawWake(r, Math.Min(1.0, prog));
+    }
+
+    static void ShowStrip(DateTime now) {
+        strip = true; lastInteract = now; hoverIdx = -1; mustLeaveIdx = -1;
+        HideWake();
+        // D57: waking is never an action — the video keeps playing untouched under the strip.
+        Log.W("watch: wake dwell complete -> options strip (video untouched)");
+    }
+
+    static void StripTick(DateTime now, bool fresh, double gx, double gy) {
+        if ((now - lastInteract).TotalMilliseconds >= Cfg.WatchDismissMs) {
+            DismissStrip("auto " + Cfg.WatchDismissMs + "ms");   // melts away; video untouched
+            return;
+        }
+        Rectangle box; Rectangle[] tiles = TileRects(out box);
+        int idx = -1;
+        if (fresh) for (int i = 0; i < tiles.Length; i++) if (tiles[i].Contains((int)gx, (int)gy)) { idx = i; break; }
+        if (mustLeaveIdx >= 0 && idx != mustLeaveIdx) mustLeaveIdx = -1;   // left the fired tile: re-armed
+        double prog = 0;
+        if (idx >= 0 && idx != mustLeaveIdx) {
+            if (idx != hoverIdx) { hoverIdx = idx; hoverStart = now; }
+            prog = (now - hoverStart).TotalMilliseconds / Cfg.DwellMs;     // content-tier dwell
+            if (prog >= 1.0) {
+                prog = 0;
+                if ((now - lastFire).TotalMilliseconds > Cfg.CooldownMs) {
+                    mustLeaveIdx = idx; hoverIdx = -1; lastFire = now; lastInteract = now;
+                    Fire(idx);
+                    if (!strip) return;   // a nav tile tore the strip down
+                }
+            }
+        } else if (idx < 0) hoverIdx = -1;
+        DrawStrip(tiles, box, hoverIdx, Math.Min(1.0, prog));
+    }
+
+    static void Fire(int idx) {   // UI thread (dwell completion or Tap)
+        switch (idx) {
+            case 0: {
+                // pause/play: TOGGLE SEMANTICS BY DESIGN — no state model. The strip shows
+                // no play/pause state, so there is nothing to desync with the player; the
+                // media key routes to the active media session even unfocused.
+                Native.Key(Native.VK_MEDIA_PLAY_PAUSE);
+                Log.W("watch: play/pause");
+                break;
+            }
+            case 1:
+            case 2: {
+                // OS volume nudge. The volume cap (integrated or legacy) stays the hard
+                // ceiling — it clamps ABOVE us within ~100ms; strictest wins, no
+                // interaction with the volcap code needed.
+                ushort vk = idx == 1 ? Native.VK_VOLUME_UP : Native.VK_VOLUME_DOWN;
+                for (int i = 0; i < Cfg.WatchVolSteps; i++) Native.Key(vk);
+                Log.W("watch: volume " + (idx == 1 ? "up" : "down"));
+                break;
+            }
+            case 3: {   // pick another: close the streaming kiosk, reveal the picker
+                DismissStrip("pick-another");
+                EndAndClose(true, "pick-another");
+                break;
+            }
+            case 4: {   // all done: close the streaming kiosk, hand the screen to ForegroundApp
+                DismissStrip("all-done");
+                EndAndClose(false, "all-done");
+                break;
+            }
+        }
+    }
+
+    // ---- touch parity (caregivers): plain taps drive the same actions as dwell ----
+    static void WakeTap(int x, int y) {
+        if (Active && !strip) ShowStrip(DateTime.Now);
+    }
+    static void StripTap(int x, int y) {   // client coords -> screen -> tile
+        if (!Active || !strip) return;
+        Rectangle box; var tiles = TileRects(out box);
+        lastInteract = DateTime.Now;
+        for (int i = 0; i < tiles.Length; i++)
+            if (tiles[i].Contains(box.X + x, box.Y + y)) { lastFire = DateTime.Now; Fire(i); break; }
+    }
+
+    // ---- geometry + drawing ----
+    static Rectangle[] TileRects(out Rectangle box) {
+        int t = Cfg.WatchTilePx, gap = 24; const int n = 5;
+        int sw = Program.ScreenW;
+        if (n * t + (n - 1) * gap > sw - 32) t = (sw - 32 - (n - 1) * gap) / n;   // small screens
+        int w = n * t + (n - 1) * gap, x0 = (sw - w) / 2, y0 = (Program.ScreenH - t) / 2;
+        box = new Rectangle(x0, y0, w, t);
+        var r = new Rectangle[n];
+        for (int i = 0; i < n; i++) r[i] = new Rectangle(x0 + i * (t + gap), y0, t, t);
+        return r;
+    }
+
+    static GraphicsPath Rounded(Rectangle r, int rad) {
+        var p = new GraphicsPath();
+        p.AddArc(r.X, r.Y, 2 * rad, 2 * rad, 180, 90);
+        p.AddArc(r.Right - 2 * rad, r.Y, 2 * rad, 2 * rad, 270, 90);
+        p.AddArc(r.Right - 2 * rad, r.Bottom - 2 * rad, 2 * rad, 2 * rad, 0, 90);
+        p.AddArc(r.X, r.Bottom - 2 * rad, 2 * rad, 2 * rad, 90, 90);
+        p.CloseFigure(); return p;
+    }
+
+    static void DrawWake(Rectangle r, double prog) {
+        int key = (int)(prog * 40) * 31 + r.X * 7 + r.Y;   // dirty key: redraw only on change
+        if (key == lastWakeKey) return;
+        lastWakeKey = key;
+        using (var bmp = new Bitmap(r.Width, r.Height, PixelFormat.Format32bppArgb))
+        using (var g = Graphics.FromImage(bmp)) {
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            var face = new Rectangle(2, 2, r.Width - 5, r.Height - 5);
+            using (var path = Rounded(face, 16)) {
+                using (var bg = new SolidBrush(Color.FromArgb(150, 16, 18, 22))) g.FillPath(bg, path);
+                using (var pen = new Pen(Color.FromArgb(210, 245, 250, 250), 3f)) g.DrawPath(pen, path);
+            }
+            // center dot: same visual language as the ring's fixation dot
+            float c = r.Width / 2f;
+            using (var br = new SolidBrush(Color.FromArgb(210, 15, 124, 138))) g.FillEllipse(br, c - 7, r.Height / 2f - 7, 14, 14);
+            if (prog > 0) {
+                var ring = new RectangleF(10, 10, r.Width - 20, r.Height - 20);
+                using (var pen = new Pen(Color.FromArgb(255, 15, 124, 138), 6f)) {
+                    pen.StartCap = LineCap.Round; pen.EndCap = LineCap.Round;
+                    g.DrawArc(pen, ring, -90, (float)(360 * prog));
+                }
+            }
+            wakeOv.SetFrame(bmp, r.X, r.Y);
+        }
+    }
+
+    // \u escapes (not raw literals): the file has no BOM and csc would read raw
+    // non-ASCII through the system codepage. U+23EF play/pause, U+2212 minus.
+    static readonly string[] TileGlyphs = { "\u23EF", "+", "\u2212", null, null };
+    static readonly string[] TileLabels = { "pause / play", "louder", "softer", "pick another", "all done" };
+
+    static void DrawStrip(Rectangle[] tiles, Rectangle box, int hover, double prog) {
+        int key = (hover + 2) * 1000 + (int)(prog * 40);
+        if (key == lastStripKey) return;
+        lastStripKey = key;
+        using (var bmp = new Bitmap(box.Width, box.Height, PixelFormat.Format32bppArgb))
+        using (var g = Graphics.FromImage(bmp))
+        using (var fmt = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center }) {
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAlias;
+            for (int i = 0; i < tiles.Length; i++) {
+                var lr = new Rectangle(tiles[i].X - box.X, 0, tiles[i].Width, tiles[i].Height);
+                using (var path = Rounded(lr, 18)) {
+                    // near-black backing, thick white border: high contrast over any video
+                    using (var bg = new SolidBrush(Color.FromArgb(232, 16, 18, 22))) g.FillPath(bg, path);
+                    using (var pen = new Pen(Color.FromArgb(255, 245, 250, 250), i == hover ? 6f : 3f)) g.DrawPath(pen, path);
+                }
+                using (var white = new SolidBrush(Color.White)) {
+                    if (TileGlyphs[i] != null) {
+                        using (var f = new Font("Segoe UI Symbol", 52, FontStyle.Bold))
+                            g.DrawString(TileGlyphs[i], f, white, new RectangleF(lr.X, lr.Y, lr.Width, lr.Height * 0.64f), fmt);
+                        using (var f2 = new Font("Segoe UI", 20, FontStyle.Bold))
+                            g.DrawString(TileLabels[i], f2, white, new RectangleF(lr.X, lr.Y + lr.Height * 0.60f, lr.Width, lr.Height * 0.34f), fmt);
+                    } else {
+                        // text-forward nav tiles (her spec: text over symbols, large type)
+                        using (var f = new Font("Segoe UI", 30, FontStyle.Bold))
+                            g.DrawString(TileLabels[i], f, white, new RectangleF(lr.X + 8, lr.Y, lr.Width - 16, lr.Height), fmt);
+                    }
+                }
+                if (i == hover && prog > 0) {   // dwell progress: teal bar along the tile bottom
+                    using (var bar = new SolidBrush(Color.FromArgb(255, 122, 205, 216)))
+                        g.FillRectangle(bar, lr.X + 10, lr.Bottom - 16, (int)((lr.Width - 20) * prog), 8);
+                }
+            }
+            stripOv.SetFrame(bmp, box.X, box.Y);
+        }
+    }
+}
+
 static class Program {
     static Filtered F = new Filtered();
     static Pipeline pipe = new Pipeline();     // owned by callback thread (gaze) or timer (mouse sim)
     static Overlay Ov;
     static Bus bus;
     static int SW, SH;
+    public static int ScreenW { get { return SW; } }   // for the watch overlays' geometry
+    public static int ScreenH { get { return SH; } }
     public static volatile bool TrackerConnected;
+
+    // Latest FILTERED gaze sample for the watch overlays: valid + fresh ONLY. This is
+    // the watch-mode safety gate (see the Watch class comment) — gaze samples, NEVER
+    // the OS cursor position, which the track-loss park moves on her behalf.
+    public static bool ReadFreshGaze(out double px, out double py) {
+        bool valid; int stamp;
+        lock (F.Lock) { valid = F.Valid; px = F.Px; py = F.Py; stamp = F.StampTick; }
+        return valid && (Environment.TickCount - stamp) < Cfg.FreshMs;
+    }
     static volatile bool pipeReset;            // set by config reload; honored by the owning thread
 
     // Live Tobii handles for the connected tracker (published by the service loop) so a
@@ -766,7 +1272,7 @@ static class Program {
     // EXIT DOOR (phase 4.1): close every RaeGaze kiosk chrome (matched by command
     // line, never by window title — 7/24 lesson), then foreground TD Snap (UWP).
     // Runs in the interactive session because ERAgaze itself does.
-    static string CmdLineOf(int pid) {
+    public static string CmdLineOf(int pid) {   // public: Watch matches the streaming kiosk by cmdline
         try {
             using (var s = new System.Management.ManagementObjectSearcher(
                 "SELECT CommandLine FROM Win32_Process WHERE ProcessId = " + pid))
@@ -776,6 +1282,10 @@ static class Program {
         return "";
     }
     public static void ExitKiosks() {
+        // The exit door closes EVERY kiosk — including a streaming kiosk — so watch mode
+        // must end with it (v2.5; the default streaming profile lives under BaseDir and
+        // matches the same sweep below).
+        Watch.Deactivate("app-exit");
         // Our kiosks are identified by their Chrome profile dir living under BaseDir, so
         // match on BaseDir's NAME ("RaeGaze" under the compat default — same behavior).
         string kioskTag = Path.GetFileName(Cfg.BaseDir);
@@ -794,6 +1304,92 @@ static class Program {
             try { System.Diagnostics.Process.Start("explorer.exe", Cfg.ForegroundApp); } catch { }
         Log.W("kiosks closed" + (string.IsNullOrEmpty(Cfg.ForegroundApp) ? " (no foreground app configured)"
                                                                          : "; foregrounded " + Cfg.ForegroundApp));
+    }
+
+    // ---- movie-player watch mode: streaming-kiosk lifecycle (v2.5) ----
+    // Chrome resolution: "ChromePath" in ERAgaze.json, else the standard install spots.
+    static string ResolveChrome() {
+        if (!string.IsNullOrEmpty(Cfg.ChromePath) && File.Exists(Cfg.ChromePath)) return Cfg.ChromePath;
+        string[] cand = {
+            @"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            @"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"Google\Chrome\Application\chrome.exe")
+        };
+        foreach (var c in cand) if (File.Exists(c)) return c;
+        Log.W("chrome not found (set \"ChromePath\" in ERAgaze.json)");
+        return null;
+    }
+
+    // Optional per-launch profile override: a plain NAME under BaseDir only, so the
+    // profile stays inside the /app/exit kiosk sweep and out of arbitrary paths.
+    public static bool ValidProfileName(string name) {
+        if (string.IsNullOrEmpty(name)) return true;   // empty = use StreamingProfileDir
+        foreach (char c in name) if (!char.IsLetterOrDigit(c) && c != '-' && c != '_') return false;
+        return true;
+    }
+
+    // Kill every chrome whose command line contains the given marker (a profile dir).
+    static void KillChromeByCmd(string marker) {
+        if (string.IsNullOrEmpty(marker)) return;
+        try {
+            foreach (var p in System.Diagnostics.Process.GetProcessesByName("chrome")) {
+                try { if (CmdLineOf(p.Id).IndexOf(marker, StringComparison.OrdinalIgnoreCase) >= 0) p.Kill(); } catch { }
+            }
+        } catch { }
+    }
+
+    // Spawn the streaming kiosk (EllieMusic.bat flag set; url LAST) and arm watch mode.
+    // Runs on a worker thread — the /app/launch handler already replied 200.
+    public static void LaunchStreamingKiosk(string url, bool watch, string titleId, string profileName) {
+        string dir = string.IsNullOrEmpty(profileName) ? Cfg.StreamingDir() : Path.Combine(Cfg.BaseDir, profileName);
+        string chrome = ResolveChrome(); if (chrome == null) return;
+        // A same-profile relaunch would JOIN the existing Chrome instance (which ignores
+        // --kiosk on a second launch): close any prior streaming kiosk on this profile.
+        KillChromeByCmd(dir);
+        try {
+            var psi = new System.Diagnostics.ProcessStartInfo(chrome,
+                "--force-device-scale-factor=1 --no-first-run --disable-pinch " +
+                "--overscroll-history-navigation=0 --autoplay-policy=no-user-gesture-required " +
+                "--kiosk --user-data-dir=\"" + dir + "\" \"" + url + "\"");
+            psi.UseShellExecute = false;
+            var p = System.Diagnostics.Process.Start(psi);
+            int pid = p != null ? p.Id : 0;
+            if (watch) Watch.Begin(dir, titleId, pid);
+            Log.W("/app/launch" + (watch ? " watch" : "") + " pid=" + pid + " profile=" + dir + " url=" + url);
+        } catch (Exception ex) { Log.W("/app/launch spawn failed: " + ex.Message); }
+    }
+
+    // Close ONLY the streaming kiosk (the picker kiosk survives), then bring the picker
+    // forward — or hand the screen to ForegroundApp when no other kiosk is running.
+    public static void CloseStreamingKiosk(string dir, bool preferPicker) {
+        KillChromeByCmd(dir);
+        System.Threading.Thread.Sleep(400);
+        if (preferPicker && ForegroundPickerKiosk(dir)) {
+            Log.W("watch-end: streaming kiosk closed; picker kiosk foregrounded"); return;
+        }
+        if (!string.IsNullOrEmpty(Cfg.ForegroundApp))
+            try { System.Diagnostics.Process.Start("explorer.exe", Cfg.ForegroundApp); } catch { }
+        Log.W("watch-end: streaming kiosk closed; " +
+              (string.IsNullOrEmpty(Cfg.ForegroundApp) ? "no foreground app configured" : "foregrounded " + Cfg.ForegroundApp));
+    }
+
+    // Any OTHER RaeGaze kiosk chrome still running (matched like ExitKiosks: BaseDir name
+    // + "-profile", excluding the streaming profile) = the picker. Foreground its window.
+    static bool ForegroundPickerKiosk(string excludeDir) {
+        string kioskTag = Path.GetFileName(Cfg.BaseDir);
+        try {
+            foreach (var p in System.Diagnostics.Process.GetProcessesByName("chrome")) {
+                try {
+                    string cmd = CmdLineOf(p.Id);
+                    if (cmd.Contains(kioskTag) && cmd.Contains("-profile") &&
+                        (string.IsNullOrEmpty(excludeDir) || cmd.IndexOf(excludeDir, StringComparison.OrdinalIgnoreCase) < 0)) {
+                        IntPtr h = p.MainWindowHandle;
+                        if (h != IntPtr.Zero && Native.SetForegroundWindow(h)) return true;
+                    }
+                } catch { }
+            }
+        } catch { }
+        return false;
     }
 
     // ---- VolCap status/control for the settings page ----
@@ -949,7 +1545,7 @@ static class Program {
         Log.W("mouse hook " + (hookH != IntPtr.Zero ? "installed" : "FAILED err=" + Marshal.GetLastWin32Error()));
         var t = new System.Windows.Forms.Timer { Interval = 16 };
         t.Tick += Tick;
-        Ov.Load += (s, e) => { Ov.SetFrame(Blank(), -100, -100); t.Start(); };
+        Ov.Load += (s, e) => { Ov.SetFrame(Blank(), -100, -100); Watch.CreateOverlays(); t.Start(); };
         Application.Run(Ov);
     }
 
@@ -1042,6 +1638,7 @@ static class Program {
 
     static bool Suppressed() {
         if (Cfg.Force) return false;
+        if (Watch.CursorSuppressed()) return true;   // watch mode: streaming kiosk foreground (v2.5)
         string p = Native.ForegroundProc();
         foreach (var d in Cfg.Deny) if (p.Contains(d)) return true;
         return false;
@@ -1100,6 +1697,7 @@ static class Program {
         if (bus != null) bus.StatusExtra =
             "\"suppressed\":" + (Suppressed() ? "true" : "false") + ",\"locked\":" + (locked ? "true" : "false") +
             ",\"parked\":" + (parked ? "true" : "false") + ",\"loss\":" + nLoss + ",\"lockFlaps\":" + nLockFlaps +
+            ",\"watch\":" + (Watch.Active ? "true" : "false") +
             ",\"screen\":{\"w\":" + SW + ",\"h\":" + SH + "}";
     }
 
@@ -1117,12 +1715,18 @@ static class Program {
         // Parent test pause: fully inert. Hide the ring, never move the cursor, clear all
         // lock/dwell state. The gaze bus stops streaming (see GazeCallback) but the HTTP
         // server keeps serving /status + /config so the settings page can un-pause.
-        if (Cfg.Paused) { Ov.SetFrame(Blank(), -100, -100); haveAnchor = false; locked = false; armed = false; parked = false; breakRun = 0; return; }
+        if (Cfg.Paused) { Ov.SetFrame(Blank(), -100, -100); Watch.HideFrames(); haveAnchor = false; locked = false; armed = false; parked = false; breakRun = 0; return; }
+
+        // Mouse-sim reads BEFORE suppression so the watch overlays stay QA-testable while
+        // suppressed (gaze mode already publishes from its callback thread regardless).
+        if (Cfg.Source == "mouse") ReadMouseSim();
+
+        // Watch-mode surfaces (wake target / options strip) pump even while the cursor is
+        // suppressed over the streaming kiosk — that is their whole job (v2.5).
+        Watch.Tick(now);
 
         // Step aside for TD Snap / Tobii UIs (their own gaze runs there). Bus keeps streaming.
         if (Suppressed()) { Ov.SetFrame(Blank(), -100, -100); haveAnchor = false; locked = false; armed = false; return; }
-
-        if (Cfg.Source == "mouse") ReadMouseSim();
 
         // read the latest filtered sample
         bool valid; double px, py; long seq; int stamp;
