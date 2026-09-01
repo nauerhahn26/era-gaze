@@ -1427,23 +1427,34 @@ static class Program {
         // must end with it (v2.5; the default streaming profile lives under BaseDir and
         // matches the same sweep below).
         Watch.Deactivate("app-exit");
-        // Our kiosks are identified by their Chrome profile dir living under BaseDir, so
-        // match on BaseDir's NAME ("RaeGaze" under the compat default — same behavior).
+        // Which windows are OURS? Two markers, because the public product and
+        // the family build differ (dad 9/1: the exit door returned him to TD
+        // Snap but left Making Words running behind it):
+        //   * the hub's kiosks always carry a "kiosk-profile" user-data-dir
+        //   * the family build's carry BaseDir's name (e.g. "RaeGaze")
+        // and BOTH browsers must be swept: the hub launches Edge when Chrome
+        // is absent, and the old sweep only looked at chrome.exe.
         string kioskTag = Path.GetFileName(Cfg.BaseDir);
-        try {
-            foreach (var p in System.Diagnostics.Process.GetProcessesByName("chrome")) {
-                try {
-                    string cmd = CmdLineOf(p.Id);
-                    if (cmd.Contains(kioskTag) && cmd.Contains("-profile")) p.Kill();
-                } catch { }
-            }
-        } catch { }
+        int closed = 0;
+        foreach (string exe in new string[] { "chrome", "msedge" }) {
+            try {
+                foreach (var p in System.Diagnostics.Process.GetProcessesByName(exe)) {
+                    try {
+                        string cmd = CmdLineOf(p.Id);
+                        if (string.IsNullOrEmpty(cmd)) continue;
+                        bool ours = cmd.IndexOf("kiosk-profile", StringComparison.OrdinalIgnoreCase) >= 0
+                                 || (cmd.Contains(kioskTag) && cmd.Contains("-profile"));
+                        if (ours) { p.Kill(); closed++; }
+                    } catch { }
+                }
+            } catch { }
+        }
         System.Threading.Thread.Sleep(400);
         // Hand the screen back to the configured app (v2.4: "ForegroundApp" in ERAgaze.json;
         // shell: URIs only, launched via explorer.exe; default = TD Snap's AUMID; "" = none).
         if (!string.IsNullOrEmpty(Cfg.ForegroundApp))
             try { System.Diagnostics.Process.Start("explorer.exe", Cfg.ForegroundApp); } catch { }
-        Log.W("kiosks closed" + (string.IsNullOrEmpty(Cfg.ForegroundApp) ? " (no foreground app configured)"
+        Log.W("kiosks closed: " + closed + (string.IsNullOrEmpty(Cfg.ForegroundApp) ? " (no foreground app configured)"
                                                                          : "; foregrounded " + Cfg.ForegroundApp));
     }
 
