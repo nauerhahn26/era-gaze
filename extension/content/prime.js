@@ -1,4 +1,4 @@
-// New ERA Watch Companion - Prime Video content script. v1 SKELETON. MPL-2.0.
+// Our Era Comms Watch Companion - Prime Video content script. v1 SKELETON. MPL-2.0.
 // (Prime itself is P3, shipping with the owned library - this skeleton rides along.)
 //
 // SELECTOR FACTS ONLY below (see README.md license rule): Amazon's atvwebplayersdk-

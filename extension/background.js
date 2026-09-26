@@ -1,4 +1,4 @@
-// New ERA Watch Companion - background service worker (MV3). MPL-2.0 (repo LICENSE;
+// Our Era Comms Watch Companion - background service worker (MV3). MPL-2.0 (repo LICENSE;
 // see README.md for the OSS-reuse rule).
 //
 // Why this exists: content scripts on https pages cannot fetch http://127.0.0.1

@@ -1,6 +1,6 @@
 # era-gaze
 
-The gaze layer of the New ERA Communications family: **ERAgaze**, a single-file
+The gaze layer of Our Era Communication Tools (Our Era Comms): **ERAgaze**, a single-file
 C# engine (no SDK, no packages — compiles with the .NET Framework csc.exe that
 ships in Windows) for Tobii Stream Engine trackers (TD I-13, PCEye, ...):
 
@@ -22,3 +22,9 @@ to a configured cap (Core Audio event + poll; never touches mute/vol-down).
 Requires the device's own Tobii runtime (the installer locates
 `tobii_stream_engine.dll` in the existing Tobii installation — nothing
 proprietary is bundled or redistributed). License: MPL-2.0; see NOTICE.
+
+Data folder: `C:\Users\Public\ERAgaze` (config `ERAgaze.json`, log, owner/boot
+markers, streaming profile), overridable with `--base=<path>` or `ERAGAZE_BASE`.
+Before 2026-09 the default was `C:\Users\Public\RaeGaze` (the old codename);
+on first start ERAgaze moves that folder to the new name and leaves a junction
+at the old path, so anything that targets the old path keeps working.

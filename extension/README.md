@@ -1,4 +1,4 @@
-# New ERA Watch Companion (v1 skeleton)
+# Our Era Comms Watch Companion (v1 skeleton)
 
 A thin MV3 extension that rides inside the STREAMING Chrome profile ERAgaze's
 watch mode launches (`POST /app/launch` on the gaze bus). ERAgaze works without
