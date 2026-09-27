@@ -1,4 +1,4 @@
-// RaeGaze v2 — standalone gaze service for Tobii devices (TD I-13 and any other
+// ERAgaze v2 — standalone gaze service for Tobii devices (TD I-13 and any other
 // Tobii Stream Engine tracker). Runs locally, inherits the device's own calibration
 // (gaze_point is post-calibration), and does exactly two jobs:
 //
@@ -27,7 +27,7 @@
 //
 // v2.4: public-release configurability — the three family/vendor couplings are now
 //   configurable with compat defaults (existing devices set nothing and change NOTHING):
-//   BaseDir (--base=<path> arg / ERAGAZE_BASE env / default C:\Users\Public\RaeGaze),
+//   BaseDir (--base=<path> arg / ERAGAZE_BASE env / default C:\Users\Public\ERAgaze),
 //   "ForegroundApp" (the shell: URI /app/exit hands the screen back to; default TD Snap),
 //   "DenyApps" (foreground processes where the cursor steps aside; default Tobii/Snap list).
 //
@@ -46,8 +46,8 @@
 //           edits apply live within ~2s). CLI flags override the file for that run.
 //
 // Build (on device):
-//   csc /target:winexe /platform:x64 /out:RaeGaze.exe ^
-//       /r:System.Drawing.dll /r:System.Windows.Forms.dll /r:System.Web.Extensions.dll /r:System.Management.dll RaeGaze.cs
+//   csc /target:winexe /platform:x64 /out:ERAgaze.exe ^
+//       /r:System.Drawing.dll /r:System.Windows.Forms.dll /r:System.Web.Extensions.dll /r:System.Management.dll ERAgaze.cs
 
 using System;
 using System.Collections.Generic;
@@ -132,8 +132,17 @@ static class Cfg {
     // ---- base directory (v2.4, public release: ONE resolution point for every on-disk
     // path — config, log, owner/pid, boot marker, and the Chrome-kiosk profile matcher).
     // First of: --base=<path> command-line arg, ERAGAZE_BASE environment variable, else
-    // the historical C:\Users\Public\RaeGaze. That default is the compat guarantee:
-    // Ellie's devices set neither override, so every path is byte-identical to v2.3.
+    // DefaultBaseDir (C:\Users\Public\ERAgaze, 2026-09). Devices that set neither override
+    // and still have the old default folder get it moved once, with a junction left at the
+    // old path (MigrateDefaultBaseDir below), so every file they had is still found.
+    public const string DefaultBaseDir = @"C:\Users\Public\ERAgaze";
+    // RaeGaze = the pre-2026-09 folder name (the old codename). Kept ONLY so the one-time
+    // move below can find it and the kiosk sweep can still recognise kiosks launched from it.
+    public const string OldDefaultBaseDir = @"C:\Users\Public\RaeGaze";
+    // Notes from the folder move. Log can't write yet while BaseDir resolves (LogPath is
+    // derived from BaseDir), so Main flushes these into the log once BaseDir is settled.
+    // Declared BEFORE BaseDir on purpose: static initializers run in textual order.
+    public static readonly List<string> BootNotes = new List<string>();
     public static readonly string BaseDir = ResolveBaseDir();
     static string ResolveBaseDir() {
         try {
@@ -144,7 +153,53 @@ static class Cfg {
             string env = Environment.GetEnvironmentVariable("ERAGAZE_BASE");
             if (!string.IsNullOrEmpty(env)) return env.TrimEnd('\\', '/');
         } catch { }
-        return @"C:\Users\Public\RaeGaze";
+        return MigrateDefaultBaseDir();   // default only: an overridden BaseDir is never moved
+    }
+
+    // One-time move of the old default folder to DefaultBaseDir (2026-09 rename). Runs
+    // while BaseDir resolves, i.e. at the first touch of Cfg (the top of Main, or Program's
+    // static OwnerPath just before it), before anything opens a file under BaseDir. Only
+    // when the new folder is ABSENT and the old one PRESENT: move it, then leave a junction
+    // at the old path (her TD Snap tiles launch <old>\<App>.bat by path). A junction
+    // reports Directory.Exists == true, so after the first run both exist and this does
+    // nothing (the steady state). ANY failure falls back to whichever folder really holds
+    // the files; this never throws.
+    static string MigrateDefaultBaseDir() {
+        string oldDir = OldDefaultBaseDir, newDir = DefaultBaseDir;
+        bool moved = false;
+        try {
+            if (Directory.Exists(newDir) || !Directory.Exists(oldDir)) return newDir;
+            BootNotes.Add("basedir migrate: moving " + oldDir + " -> " + newDir);
+            Directory.Move(oldDir, newDir);   // fails (and we fall back) if anything holds a file open in it
+            moved = true;
+            BootNotes.Add("basedir migrate: moved");
+            var psi = new System.Diagnostics.ProcessStartInfo("cmd.exe",
+                "/c mklink /J \"" + oldDir + "\" \"" + newDir + "\"");
+            psi.UseShellExecute = false;
+            psi.CreateNoWindow = true;
+            psi.WindowStyle = System.Diagnostics.ProcessWindowStyle.Hidden;
+            using (var p = System.Diagnostics.Process.Start(psi)) {
+                if (!p.WaitForExit(15000)) throw new Exception("mklink timed out");
+                if (p.ExitCode != 0) throw new Exception("mklink exit code " + p.ExitCode);
+            }
+            if (!Directory.Exists(oldDir)) throw new Exception("junction missing after mklink");
+            BootNotes.Add("basedir migrate: junction " + oldDir + " -> " + newDir);
+            return newDir;
+        } catch (Exception ex) {
+            BootNotes.Add("basedir migrate FAILED: " + ex.Message);
+            if (!moved) { BootNotes.Add("basedir migrate: staying on " + oldDir); return oldDir; }
+            if (Directory.Exists(oldDir)) return newDir;   // junction is there after all
+            // Moved but no junction: put the folder back so nothing that targets the old
+            // path by name goes dead; if even that fails, the files are in the new folder.
+            try {
+                Directory.Move(newDir, oldDir);
+                BootNotes.Add("basedir migrate: moved back; staying on " + oldDir);
+                return oldDir;
+            } catch (Exception ex2) {
+                BootNotes.Add("basedir migrate: move back FAILED (" + ex2.Message + "); using " + newDir);
+                return newDir;
+            }
+        }
     }
     public static string LogPath = Path.Combine(BaseDir, "eragaze.log");
     public static string ConfigPath = Path.Combine(BaseDir, "ERAgaze.json");
@@ -207,14 +262,15 @@ static class Cfg {
     // First run: write a template the caregiver team can edit (applies live within ~2s).
     public static void WriteDefault() {
         try {
-            // migrate the old RaeGaze.json name if present (rebrand to ERAgaze)
-            string old = Path.Combine(BaseDir, "RaeGaze.json");
+            // migrate the old config file name if present: <old default folder's name>.json
+            // (the pre-2026-09 codename) -> ERAgaze.json
+            string old = Path.Combine(BaseDir, Path.GetFileName(OldDefaultBaseDir) + ".json");
             if (!File.Exists(ConfigPath) && File.Exists(old)) { File.Copy(old, ConfigPath); return; }
             if (File.Exists(ConfigPath)) return;
             Directory.CreateDirectory(Path.GetDirectoryName(ConfigPath));
             File.WriteAllText(ConfigPath,
 "{\n" +
-"  \"_doc\": \"RaeGaze tuning. Edits apply live (~2s). Times in ms, distances in px.\",\n" +
+"  \"_doc\": \"ERAgaze tuning. Edits apply live (~2s). Times in ms, distances in px.\",\n" +
 "  \"dwellClick\": false,\n" +
 "  \"paused\": false,\n" +
 "  \"dwellMs\": 800,\n" +
@@ -440,7 +496,7 @@ static class Native {
     [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
     [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
     const uint MOVE = 0x0001, ABS = 0x8000, LDOWN = 0x0002, LUP = 0x0004;
-    public static readonly IntPtr SIG = new IntPtr(0x52470001); // marks RaeGaze's own injected input
+    public static readonly IntPtr SIG = new IntPtr(0x52470001); // marks ERAgaze's own injected input
     static int SW = Screen.PrimaryScreen.Bounds.Width, SH = Screen.PrimaryScreen.Bounds.Height;
 
     public static void Move(int x, int y) {
@@ -1410,7 +1466,7 @@ static class Program {
         try { if (a != IntPtr.Zero) Tobii.tobii_api_destroy(a); } catch { }
     }
 
-    // EXIT DOOR (phase 4.1): close every RaeGaze kiosk chrome (matched by command
+    // EXIT DOOR (phase 4.1): close every ERAgaze kiosk chrome (matched by command
     // line, never by window title — 7/24 lesson), then foreground TD Snap (UWP).
     // Runs in the interactive session because ERAgaze itself does.
     public static string CmdLineOf(int pid) {   // public: Watch matches the streaming kiosk by cmdline
@@ -1422,6 +1478,17 @@ static class Program {
         } catch { }
         return "";
     }
+    // A kiosk command line is ours when it carries a gaze folder name: the current
+    // BaseDir's, or either default folder's (ordinal, like the old Contains match).
+    static bool HasKioskTag(string cmd) {
+        if (string.IsNullOrEmpty(cmd)) return false;
+        string[] tags = { Path.GetFileName(Cfg.BaseDir),
+                          Path.GetFileName(Cfg.OldDefaultBaseDir),
+                          Path.GetFileName(Cfg.DefaultBaseDir) };
+        foreach (string tag in tags)
+            if (!string.IsNullOrEmpty(tag) && cmd.IndexOf(tag, StringComparison.Ordinal) >= 0) return true;
+        return false;
+    }
     public static void ExitKiosks() {
         // The exit door closes EVERY kiosk — including a streaming kiosk — so watch mode
         // must end with it (v2.5; the default streaming profile lives under BaseDir and
@@ -1431,10 +1498,11 @@ static class Program {
         // the family build differ (dad 9/1: the exit door returned him to TD
         // Snap but left Making Words running behind it):
         //   * the hub's kiosks always carry a "kiosk-profile" user-data-dir
-        //   * the family build's carry BaseDir's name (e.g. "RaeGaze")
+        //   * the family build's carry a gaze folder name: BaseDir's, or either
+        //     default folder's (a kiosk launched before the 2026-09 folder move
+        //     still carries the old one) -- see HasKioskTag
         // and BOTH browsers must be swept: the hub launches Edge when Chrome
         // is absent, and the old sweep only looked at chrome.exe.
-        string kioskTag = Path.GetFileName(Cfg.BaseDir);
         int closed = 0;
         foreach (string exe in new string[] { "chrome", "msedge" }) {
             try {
@@ -1443,7 +1511,7 @@ static class Program {
                         string cmd = CmdLineOf(p.Id);
                         if (string.IsNullOrEmpty(cmd)) continue;
                         bool ours = cmd.IndexOf("kiosk-profile", StringComparison.OrdinalIgnoreCase) >= 0
-                                 || (cmd.Contains(kioskTag) && cmd.Contains("-profile"));
+                                 || (HasKioskTag(cmd) && cmd.Contains("-profile"));
                         if (ours) { p.Kill(); closed++; }
                     } catch { }
                 }
@@ -1528,15 +1596,14 @@ static class Program {
               (string.IsNullOrEmpty(Cfg.ForegroundApp) ? "no foreground app configured" : "foregrounding " + Cfg.ForegroundApp));
     }
 
-    // Any OTHER RaeGaze kiosk chrome still running (matched like ExitKiosks: BaseDir name
-    // + "-profile", excluding the streaming profile) = the picker. Foreground its window.
+    // Any OTHER ERAgaze kiosk chrome still running (matched like ExitKiosks: a gaze folder
+    // name + "-profile", excluding the streaming profile) = the picker. Foreground its window.
     static bool ForegroundPickerKiosk(string excludeDir) {
-        string kioskTag = Path.GetFileName(Cfg.BaseDir);
         try {
             foreach (var p in System.Diagnostics.Process.GetProcessesByName("chrome")) {
                 try {
                     string cmd = CmdLineOf(p.Id);
-                    if (cmd.Contains(kioskTag) && cmd.Contains("-profile") &&
+                    if (HasKioskTag(cmd) && cmd.Contains("-profile") &&
                         (string.IsNullOrEmpty(excludeDir) || cmd.IndexOf(excludeDir, StringComparison.OrdinalIgnoreCase) < 0)) {
                         IntPtr h = p.MainWindowHandle;
                         if (h != IntPtr.Zero && Native.SetForegroundWindow(h)) return true;
@@ -1644,8 +1711,11 @@ static class Program {
 
     [STAThread]
     static void Main(string[] args) {
-        string bootPath = Path.Combine(Cfg.BaseDir, "boot.txt");   // Cfg.BaseDir resolves --base=/ERAGAZE_BASE here
+        // Cfg.BaseDir resolves --base=/ERAGAZE_BASE here, and on a default BaseDir runs the
+        // one-time old-folder move (Cfg.MigrateDefaultBaseDir) before any file is opened.
+        string bootPath = Path.Combine(Cfg.BaseDir, "boot.txt");
         try { Directory.CreateDirectory(Cfg.BaseDir); File.WriteAllText(bootPath, "boot " + DateTime.Now + " args=" + string.Join(" ", args)); } catch { }
+        try { foreach (string note in Cfg.BootNotes) Log.W(note); } catch { }
         try { RealMain(args); }
         catch (Exception ex) { try { File.AppendAllText(bootPath, "\nFATAL " + ex); } catch { } }
     }
@@ -1685,7 +1755,7 @@ static class Program {
         Native.SetProcessDPIAware();
         SW = Screen.PrimaryScreen.Bounds.Width; SH = Screen.PrimaryScreen.Bounds.Height;
         pipe.Reset();
-        Log.W("RaeGaze 2.0 start source=" + Cfg.Source + " screen=" + SW + "x" + SH +
+        Log.W("ERAgaze 2.0 start source=" + Cfg.Source + " screen=" + SW + "x" + SH +
               " median=" + Cfg.Median + " mincutoff=" + Cfg.MinCutoff + " beta=" + Cfg.Beta +
               " lock=" + Cfg.LockRadius + "/" + Cfg.LockOnMs + "ms break=" + Cfg.BreakRadius + "x" + Cfg.BreakSamples +
               " grace=" + Cfg.GraceMs + " park=" + (Cfg.ParkOnLoss ? Cfg.ParkAfterMs + "ms" : "off") +

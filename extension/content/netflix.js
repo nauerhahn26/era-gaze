@@ -1,4 +1,4 @@
-// New ERA Watch Companion - Netflix content script. v1 SKELETON. MPL-2.0.
+// Our Era Comms Watch Companion - Netflix content script. v1 SKELETON. MPL-2.0.
 //
 // SELECTOR FACTS ONLY below (see README.md license rule): sources were read as
 // documentation of which selectors exist, no code was copied from them.

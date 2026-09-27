@@ -39,6 +39,10 @@ static class RunAsUser {
         bool ok = CreateProcessAsUser(dup, null, cmd, IntPtr.Zero, IntPtr.Zero, false, 0x00000400 /*CREATE_UNICODE_ENVIRONMENT*/, env, null, ref si, out pi);
         string msg = "cmd=" + cmd + " usedLinked=" + (src != tok) + " CreateProcessAsUser=" + ok + " pid=" + (ok ? pi.pid : 0) + " err=" + Marshal.GetLastWin32Error();
         Console.WriteLine(msg);
-        try { System.IO.File.WriteAllText(@"C:\Users\Public\RaeGaze\rau_result.txt", msg); } catch { }
+        // ERAgaze's folder since 2026-09, else the pre-2026-09 folder (a device not yet moved).
+        try {
+            string dir = System.IO.Directory.Exists(@"C:\Users\Public\ERAgaze") ? @"C:\Users\Public\ERAgaze" : @"C:\Users\Public\RaeGaze";
+            System.IO.File.WriteAllText(System.IO.Path.Combine(dir, "rau_result.txt"), msg);
+        } catch { }
     }
 }

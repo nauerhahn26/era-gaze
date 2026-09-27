@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "New ERA Watch Companion",
+  "name": "Our Era Comms Watch Companion",
   "version": "0.1.0",
   "description": "Thin companion for ERAgaze watch mode: playback watchdog heartbeat and end-of-episode detection, posted to the local gaze bus (127.0.0.1:49155). v1 skeleton.",
   "background": { "service_worker": "background.js" },

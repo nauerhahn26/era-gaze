@@ -1,4 +1,4 @@
-// New ERA Watch Companion - Disney+ content script. v1 SKELETON. MPL-2.0.
+// Our Era Comms Watch Companion - Disney+ content script. v1 SKELETON. MPL-2.0.
 //
 // Disney+'s web player is built from web components: selectors must PIERCE SHADOW
 // ROOTS (a plain querySelector will miss them).
