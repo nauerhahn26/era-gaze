@@ -467,18 +467,45 @@ sealed class Overlay : Form {
         base.OnMouseClick(e);
         var t = Tap; if (t != null) t(e.X, e.Y);
     }
-    public void SetFrame(Bitmap bmp, int x, int y) {
-        IntPtr screenDc = GetDC(IntPtr.Zero), memDc = CreateCompatibleDC(screenDc), hBmp = IntPtr.Zero, old = IntPtr.Zero;
+    // Hiding must not allocate a bitmap or enter GDI+. This runs every timer tick
+    // while paused, suppressed or parked, including desktop/sleep transitions.
+    public void HideFrame() { if (Visible) Hide(); }
+
+    DateTime lastFrameError = DateTime.MinValue;
+    void FrameError(string reason) {
+        HideFrame();
+        if ((DateTime.UtcNow - lastFrameError).TotalSeconds < 30) return;
+        lastFrameError = DateTime.UtcNow;
+        Log.W("overlay frame skipped: " + reason);
+    }
+
+    // A temporarily unavailable display must not open WinForms' modal exception
+    // dialog and stall the UI timer. Keep the caller's bitmap ownership; release
+    // every native resource, hide stale pixels, and let the next frame retry.
+    public bool SetFrame(Bitmap bmp, int x, int y) {
+        IntPtr screenDc = IntPtr.Zero, memDc = IntPtr.Zero, hBmp = IntPtr.Zero, old = IntPtr.Zero;
         try {
+            screenDc = GetDC(IntPtr.Zero);
+            if (screenDc == IntPtr.Zero) { FrameError("GetDC"); return false; }
+            memDc = CreateCompatibleDC(screenDc);
+            if (memDc == IntPtr.Zero) { FrameError("CreateCompatibleDC"); return false; }
             hBmp = bmp.GetHbitmap(Color.FromArgb(0)); old = SelectObject(memDc, hBmp);
+            if (old == IntPtr.Zero || old == new IntPtr(-1)) { FrameError("SelectObject"); return false; }
             var size = new SIZE(bmp.Width, bmp.Height); var pdst = new POINT(x, y); var psrc = new POINT(0, 0);
             var bf = new BLENDFUNCTION { Op = 0, Flags = 0, Alpha = 255, Format = 1 };
-            UpdateLayeredWindow(Handle, screenDc, ref pdst, ref size, memDc, ref psrc, 0, ref bf, 2);
+            if (!UpdateLayeredWindow(Handle, screenDc, ref pdst, ref size, memDc, ref psrc, 0, ref bf, 2)) {
+                FrameError("UpdateLayeredWindow error=" + Marshal.GetLastWin32Error()); return false;
+            }
+            if (!Visible) Show();
+            return true;
+        } catch (ExternalException ex) {
+            FrameError(ex.ToString());
+            return false;
         } finally {
-            ReleaseDC(IntPtr.Zero, screenDc);
-            if (old != IntPtr.Zero) SelectObject(memDc, old);
+            if (old != IntPtr.Zero && old != new IntPtr(-1)) SelectObject(memDc, old);
             if (hBmp != IntPtr.Zero) DeleteObject(hBmp);
-            DeleteDC(memDc);
+            if (memDc != IntPtr.Zero) DeleteDC(memDc);
+            if (screenDc != IntPtr.Zero) ReleaseDC(IntPtr.Zero, screenDc);
         }
     }
     // Re-assert top-of-Z. A full-screen Chrome kiosk (Book Reader, Making Words, the
@@ -1026,11 +1053,10 @@ static class Watch {
     const int HIDDEN = int.MinValue;
     static int lastWakeKey = HIDDEN, lastStripKey = HIDDEN;   // dirty keys: skip redundant redraws
 
-    static Bitmap Blank() { return new Bitmap(2, 2, PixelFormat.Format32bppArgb); }
 
     public static void CreateOverlays() {   // UI thread (Ov.Load) ONLY
-        wakeOv = new Overlay(true); wakeOv.Tap += WakeTap; wakeOv.Show(); wakeOv.SetFrame(Blank(), -100, -100);
-        stripOv = new Overlay(true); stripOv.Tap += StripTap; stripOv.Show(); stripOv.SetFrame(Blank(), -100, -100);
+        wakeOv = new Overlay(true); wakeOv.Tap += WakeTap; wakeOv.Show(); wakeOv.HideFrame();
+        stripOv = new Overlay(true); stripOv.Tap += StripTap; stripOv.Show(); stripOv.HideFrame();
         // RE-ARM ACROSS RESTART (8/28: an engine swap mid-movie must not strand her
         // without the escape overlay): a streaming kiosk already running = watch on.
         System.Threading.ThreadPool.QueueUserWorkItem(delegate {
@@ -1138,11 +1164,11 @@ static class Watch {
         HideWake(); HideStripFrame();
     }
     static void HideWake() {
-        if (lastWakeKey != HIDDEN) { wakeOv.SetFrame(Blank(), -100, -100); lastWakeKey = HIDDEN; }
+        if (lastWakeKey != HIDDEN) { wakeOv.HideFrame(); lastWakeKey = HIDDEN; }
         wakeArmed = false;
     }
     static void HideStripFrame() {
-        if (lastStripKey != HIDDEN) { stripOv.SetFrame(Blank(), -100, -100); lastStripKey = HIDDEN; }
+        if (lastStripKey != HIDDEN) { stripOv.HideFrame(); lastStripKey = HIDDEN; }
         hoverIdx = -1; mustLeaveIdx = -1;
     }
     static void DismissStrip(string why) {
@@ -1332,7 +1358,6 @@ static class Watch {
     static void DrawWake(Rectangle r, double prog) {
         int key = (int)(prog * 40) * 31 + r.X * 7 + r.Y;   // dirty key: redraw only on change
         if (key == lastWakeKey) return;
-        lastWakeKey = key;
         using (var bmp = new Bitmap(r.Width, r.Height, PixelFormat.Format32bppArgb))
         using (var g = Graphics.FromImage(bmp)) {
             g.SmoothingMode = SmoothingMode.AntiAlias;
@@ -1351,7 +1376,8 @@ static class Watch {
                     g.DrawArc(pen, ring, -90, (float)(360 * prog));
                 }
             }
-            wakeOv.SetFrame(bmp, r.X, r.Y);
+            if (wakeOv.SetFrame(bmp, r.X, r.Y)) lastWakeKey = key;
+            else lastWakeKey = int.MinValue;
         }
     }
 
@@ -1385,7 +1411,6 @@ static class Watch {
     static void DrawStrip(Rectangle[] tiles, Rectangle box, int hover, double prog) {
         int key = (hover + 2) * 1000 + (int)(prog * 40) + (mediaUrl != null ? 100000 : 0) + (mediaNextUrl != null ? 200000 : 0);
         if (key == lastStripKey) return;
-        lastStripKey = key;
         using (var bmp = new Bitmap(box.Width, box.Height, PixelFormat.Format32bppArgb))
         using (var g = Graphics.FromImage(bmp))
         using (var fmt = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center }) {
@@ -1429,7 +1454,8 @@ static class Watch {
                         g.FillRectangle(bar, lr.X + 10, lr.Bottom - 14, (int)((lr.Width - 20) * prog), 7);
                 }
             }
-            stripOv.SetFrame(bmp, box.X, box.Y);
+            if (stripOv.SetFrame(bmp, box.X, box.Y)) lastStripKey = key;
+            else lastStripKey = int.MinValue;
         }
     }
 }
@@ -1788,11 +1814,10 @@ static class Program {
         Log.W("mouse hook " + (hookH != IntPtr.Zero ? "installed" : "FAILED err=" + Marshal.GetLastWin32Error()));
         var t = new System.Windows.Forms.Timer { Interval = 16 };
         t.Tick += Tick;
-        Ov.Load += (s, e) => { Ov.SetFrame(Blank(), -100, -100); Watch.CreateOverlays(); t.Start(); };
+        Ov.Load += (s, e) => { Ov.HideFrame(); Watch.CreateOverlays(); t.Start(); };
         Application.Run(Ov);
     }
 
-    static Bitmap Blank() { return new Bitmap(2, 2, PixelFormat.Format32bppArgb); }
 
     // ---- tracker service loop: connect, stream, and on any failure retry forever ----
     static void StartTobiiService() {
@@ -1958,7 +1983,7 @@ static class Program {
         // Parent test pause: fully inert. Hide the ring, never move the cursor, clear all
         // lock/dwell state. The gaze bus stops streaming (see GazeCallback) but the HTTP
         // server keeps serving /status + /config so the settings page can un-pause.
-        if (Cfg.Paused) { Ov.SetFrame(Blank(), -100, -100); Watch.HideFrames(); haveAnchor = false; locked = false; armed = false; parked = false; breakRun = 0; return; }
+        if (Cfg.Paused) { Ov.HideFrame(); Watch.HideFrames(); haveAnchor = false; locked = false; armed = false; parked = false; breakRun = 0; return; }
 
         // Mouse-sim reads BEFORE suppression so the watch overlays stay QA-testable while
         // suppressed (gaze mode already publishes from its callback thread regardless).
@@ -1969,7 +1994,7 @@ static class Program {
         Watch.Tick(now);
 
         // Step aside for TD Snap / Tobii UIs (their own gaze runs there). Bus keeps streaming.
-        if (Suppressed()) { Ov.SetFrame(Blank(), -100, -100); haveAnchor = false; locked = false; armed = false; return; }
+        if (Suppressed()) { Ov.HideFrame(); haveAnchor = false; locked = false; armed = false; return; }
 
         // read the latest filtered sample
         bool valid; double px, py; long seq; int stamp;
@@ -1992,7 +2017,7 @@ static class Program {
                 parked = true; nParks++;
                 Log.W("track loss " + lossMs + "ms -> parked cursor");
             }
-            if (parked) Ov.SetFrame(Blank(), -100, -100); else RenderState(now, 0, true);
+            if (parked) Ov.HideFrame(); else RenderState(now, 0, true);
             return;
         }
         if (inLoss) { inLoss = false; }
@@ -2020,7 +2045,7 @@ static class Program {
 
         // ---- yield to a human, then drive the cursor ----
         bool yielding = now < yieldUntil;
-        if (yielding) { Ov.SetFrame(Blank(), -100, -100); armed = false; return; }  // hands off, ring hidden
+        if (yielding) { Ov.HideFrame(); armed = false; return; }  // hands off, ring hidden
         if (Cfg.Source == "gaze") Native.Move(cx, cy);
 
         // ---- dwell-to-click: OPT-IN only (caregiver/QA surfaces). Loss above disarms it. ----
@@ -2050,7 +2075,7 @@ static class Program {
     // Ring states: normal follow (white), locked fixation (teal tint), paused/loss (gray, no dot).
     static void RenderState(DateTime now, double progress, bool paused) {
         int cx = (int)Math.Round(anchorX), cy = (int)Math.Round(anchorY);
-        if (!haveAnchor) { Ov.SetFrame(Blank(), -100, -100); return; }
+        if (!haveAnchor) { Ov.HideFrame(); return; }
         int R = Cfg.Radius, pad = 12, size = 2 * (R + pad);
         using (var bmp = new Bitmap(size, size, PixelFormat.Format32bppArgb))
         using (var g = Graphics.FromImage(bmp)) {

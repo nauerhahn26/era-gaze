@@ -28,3 +28,11 @@ markers, streaming profile), overridable with `--base=<path>` or `ERAGAZE_BASE`.
 Before 2026-09 the default was `C:\Users\Public\RaeGaze` (the old codename);
 on first start ERAgaze moves that folder to the new name and leaves a junction
 at the old path, so anything that targets the old path keeps working.
+
+Overlay rendering regression: on an interactive Windows desktop, run
+`powershell -ExecutionPolicy Bypass -File tests/overlay-regression.ps1`. It
+compiles the actual engine with a separate entry point, exercises real
+hide/draw cycles and injects bitmap conversion failures to verify recovery
+and stable GDI resource use. It does not start the tracker or gaze bus.
+Temporary display failures hide the overlay and retry rather than opening a
+modal error dialog. Hiding does not allocate a bitmap.
