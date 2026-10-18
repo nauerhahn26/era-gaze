@@ -111,7 +111,8 @@ static class Cfg {
     // volume unasked. Each family opts in PER DEVICE by setting "VolCapEnabled": true
     // (and tuning "VolCapLevel") in ERAgaze.json — hot-reload applies it within ~2s.
     public static bool VolCapEnabled = false;
-    public static int VolCapLevel = 55;      // clamp target, 0-100 (% of master volume)
+    public static bool VolCapManaged = false; // Settings has taken over the legacy watchdog
+    public static int VolCapLevel = 45;      // clamp target, 0-100 (% of master volume)
 
     // ---- movie-player watch mode (v2.5, D57) ----
     public static string StreamingProfileDir = "";  // "" = <BaseDir>\streaming-profile
@@ -239,6 +240,7 @@ static class Cfg {
             FilterResetMs = I(d, "filterResetMs", FilterResetMs);
             Bus = B(d, "bus", Bus); Port = I(d, "port", Port);
             VolCapEnabled = B(d, "VolCapEnabled", VolCapEnabled);
+            VolCapManaged = B(d, "VolCapManaged", VolCapManaged);
             VolCapLevel = Math.Max(0, Math.Min(100, I(d, "VolCapLevel", VolCapLevel)));
             StreamingProfileDir = S(d, "StreamingProfileDir", StreamingProfileDir);
             ChromePath = S(d, "ChromePath", ChromePath);
@@ -301,7 +303,7 @@ static class Cfg {
 "  \"port\": 49155,\n" +
 "  \"_doc4\": \"Volume cap: ships OFF — opt in per device. true = master volume above VolCapLevel is clamped back down (mute + volume-down never touched).\",\n" +
 "  \"VolCapEnabled\": false,\n" +
-"  \"VolCapLevel\": 55,\n" +
+"  \"VolCapLevel\": 45,\n" +
 "  \"_doc5\": \"Watch mode (movie player): StreamingProfileDir '' = <BaseDir>\\\\streaming-profile; ChromePath '' = auto-detect; WatchWakeCorner auto = opposite the park corner; WatchWakeDwellMs floors at 1600 (nav tier); WatchDismissMs = options-strip auto-dismiss; WatchFeedbackPct = wake-corner region (% screen width) where the cursor+ring return as gaze feedback.\",\n" +
 "  \"StreamingProfileDir\": \"\",\n" +
 "  \"ChromePath\": \"\",\n" +
@@ -920,20 +922,34 @@ sealed class Bus {
                     if (ctx.Request.HttpMethod == "OPTIONS") { ctx.Response.StatusCode = 204; ctx.Response.Close(); }
                     else {
                         if (ctx.Request.HttpMethod == "POST") {
-                            bool wantOn = true, hasOn = false, hasIntegrated = false;
-                            bool intEnabled = Cfg.VolCapEnabled; int intCap = Cfg.VolCapLevel;
-                            try {
-                                string bodyIn;
-                                using (var sr = new StreamReader(ctx.Request.InputStream, ctx.Request.ContentEncoding)) bodyIn = sr.ReadToEnd();
-                                var d = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(bodyIn);
-                                if (d != null && d.ContainsKey("on")) { hasOn = true; wantOn = Convert.ToBoolean(d["on"]); }
-                                if (d != null && d.ContainsKey("integratedEnabled")) { hasIntegrated = true; intEnabled = Convert.ToBoolean(d["integratedEnabled"]); }
-                                if (d != null && d.ContainsKey("integratedCap")) { hasIntegrated = true; intCap = Convert.ToInt32(d["integratedCap"]); }
-                            } catch { }
-                            if (hasIntegrated) Program.VolCapIntegratedSet(intEnabled, intCap);
-                            if (hasOn || !hasIntegrated) {   // legacy path, byte-for-byte old behavior
-                                Program.VolCapSet(wantOn);
-                                System.Threading.Thread.Sleep(1200);   // let the task/process settle so the reply reflects reality
+                            string bodyIn;
+                            using (var sr = new StreamReader(ctx.Request.InputStream, ctx.Request.ContentEncoding)) bodyIn = sr.ReadToEnd();
+                            Dictionary<string, object> d = null;
+                            try { d = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(bodyIn); } catch { }
+                            if (d != null && (d.ContainsKey("deviceEnabled") || d.ContainsKey("deviceCap"))) {
+                                bool enabled; int cap;
+                                if (!Program.TryDeviceVolumeRequest(d, out enabled, out cap)) {
+                                    ctx.Response.StatusCode = 400; ctx.Response.Close(); continue;
+                                }
+                                try { Program.VolCapDeviceSet(enabled, cap); }
+                                catch (Exception ex) {
+                                    Log.W("device volume save failed: " + ex.Message);
+                                    ctx.Response.StatusCode = 500; ctx.Response.Close(); continue;
+                                }
+                            } else {
+                                // Preserve the old protocol for older Settings pages.
+                                bool wantOn = true, hasOn = false, hasIntegrated = false;
+                                bool intEnabled = Cfg.VolCapEnabled; int intCap = Cfg.VolCapLevel;
+                                try {
+                                    if (d != null && d.ContainsKey("on")) { hasOn = true; wantOn = Convert.ToBoolean(d["on"]); }
+                                    if (d != null && d.ContainsKey("integratedEnabled")) { hasIntegrated = true; intEnabled = Convert.ToBoolean(d["integratedEnabled"]); }
+                                    if (d != null && d.ContainsKey("integratedCap")) { hasIntegrated = true; intCap = Convert.ToInt32(d["integratedCap"]); }
+                                } catch { }
+                                if (hasIntegrated) Program.VolCapIntegratedSet(intEnabled, intCap);
+                                if (hasOn || !hasIntegrated) {
+                                    Program.VolCapSet(wantOn);
+                                    System.Threading.Thread.Sleep(1200);
+                                }
                             }
                         }
                         byte[] vb = Encoding.UTF8.GetBytes(Program.VolCapStatusJson());
@@ -1674,11 +1690,60 @@ static class Program {
                 foreach (var line in System.IO.File.ReadAllLines(VolCapConf))
                     if (line.StartsWith("CAP=")) cap = line.Substring(4).Trim();
         } catch { }
+        int legacyCap;
+        if (!int.TryParse(cap, out legacyCap) || legacyCap < 0 || legacyCap > 100) { legacyCap = 55; cap = "null"; }
+        else cap = legacyCap.ToString();
+        bool legacyActive = installed && !Cfg.VolCapManaged && running;
+        bool deviceEnabled = Cfg.VolCapEnabled || legacyActive;
+        int deviceCap = Cfg.VolCapEnabled ? Cfg.VolCapLevel : (legacyActive ? legacyCap : Cfg.VolCapLevel);
+        if (Cfg.VolCapEnabled && legacyActive) deviceCap = Math.Min(deviceCap, legacyCap);
         string cur = (Cfg.VolCapEnabled && VolCapEngine.LastPercent >= 0) ? VolCapEngine.LastPercent.ToString() : "null";
         return "{\"installed\":" + (installed ? "true" : "false") +
                ",\"running\":" + (running ? "true" : "false") + ",\"cap\":" + cap +
+               ",\"device\":{\"enabled\":" + (deviceEnabled ? "true" : "false") + ",\"cap\":" + deviceCap + "}" +
                ",\"integrated\":{\"enabled\":" + (Cfg.VolCapEnabled ? "true" : "false") +
                ",\"cap\":" + Cfg.VolCapLevel + ",\"current\":" + cur + "}}";
+    }
+    // The unified device control owns the cap after the first explicit Settings save.
+    // Neutralize the old watchdog's persisted ceiling before stopping its exact executable;
+    // its scheduled task may restart later, but will then read CAP=100 and impose no limit.
+    // No task permissions or background self-heal can override the user's saved On/Off choice.
+    public static bool TryDeviceVolumeRequest(Dictionary<string, object> d, out bool enabled, out int cap) {
+        enabled = false; cap = 45;
+        if (!d.ContainsKey("deviceEnabled") || !(d["deviceEnabled"] is bool) ||
+            !d.ContainsKey("deviceCap") || !(d["deviceCap"] is int)) return false;
+        enabled = (bool)d["deviceEnabled"]; cap = (int)d["deviceCap"];
+        return cap >= 0 && cap <= 100;
+    }
+    static void RetireLegacyVolumeCap() {
+        if (!File.Exists(VolCapExe) && !File.Exists(VolCapConf)) return;
+        File.WriteAllText(VolCapConf, "CAP=100\r\n");
+        foreach (var process in System.Diagnostics.Process.GetProcessesByName("volcap")) {
+            using (process) {
+                if (process.HasExited) continue;
+                string executable;
+                try { executable = process.MainModule.FileName; }
+                catch (InvalidOperationException) { continue; } // exited during inspection
+                if (!string.Equals(Path.GetFullPath(executable), Path.GetFullPath(VolCapExe), StringComparison.OrdinalIgnoreCase)) continue;
+                process.Kill();
+                if (!process.WaitForExit(4000)) throw new IOException("Speaker watchdog did not stop");
+            }
+        }
+    }
+    public static void VolCapDeviceSet(bool enabled, int cap) {
+        if (cap < 0 || cap > 100) throw new ArgumentOutOfRangeException("cap");
+        bool oldEnabled = Cfg.VolCapEnabled, oldManaged = Cfg.VolCapManaged;
+        int oldCap = Cfg.VolCapLevel;
+        string update = "{\"VolCapEnabled\":" + (enabled ? "true" : "false") + ",\"VolCapLevel\":" + cap + ",\"VolCapManaged\":true}";
+        if (!MergeConfig(update)) throw new IOException("Could not persist device volume settings");
+        try { RetireLegacyVolumeCap(); }
+        catch {
+            MergeConfig("{\"VolCapEnabled\":" + (oldEnabled ? "true" : "false") + ",\"VolCapLevel\":" + oldCap + ",\"VolCapManaged\":" + (oldManaged ? "true" : "false") + "}");
+            throw;
+        }
+        Cfg.VolCapEnabled = enabled; Cfg.VolCapLevel = cap; Cfg.VolCapManaged = true;
+        VolCapEngine.Apply();
+        Log.W("device volume saved: " + (enabled ? "ON" : "OFF") + " cap=" + cap);
     }
     // POST /volcap {"integratedEnabled","integratedCap"}: persist into ERAgaze.json (the
     // file stays the single source of truth; hot-reload re-reads the same values) and
