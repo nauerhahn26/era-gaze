@@ -36,3 +36,18 @@ hide/draw cycles and injects bitmap conversion failures to verify recovery
 and stable GDI resource use. It does not start the tracker or gaze bus.
 Temporary display failures hide the overlay and retry rather than opening a
 modal error dialog. Hiding does not allocate a bitmap.
+
+### Device speaker limit
+
+The hub Settings page uses `GET /volcap` → `device: {enabled, cap}` and
+`POST /volcap {deviceEnabled, deviceCap}` for a saved, per-device speaker
+limit. Percentages are whole numbers from 0 to 100; the default value is 45.
+New devices still opt in. Both On/Off and the percentage persist in the local
+configuration. Raising the cap does not turn up current volume.
+
+The first explicit save neutralizes a legacy watchdog by writing `CAP=100`
+and stopping only its known executable. A later scheduled watchdog restart
+cannot restore its old limit or undo Off. Legacy endpoint fields remain for
+older clients. Run `tests/volume-cap-regression.ps1` on Windows to exercise
+migration, changes in both directions, Off/restart, task restart and errors
+against the real engine and standalone watchdog in a temporary sandbox.
